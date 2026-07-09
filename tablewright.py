@@ -67,9 +67,11 @@ two characters, because a single ``<X>`` is reserved syntax.
 A rule body may also contain a regex-style character range written in double
 brackets, e.g. ``[[a-zA-Z]]`` or ``[[abcg-i]]``. A range expands inline into a
 positive set with every member character enumerated (``[[a-c]]`` becomes the set
-``{a, b, c}``); spans may be combined and mixed with literals, an escaped dash
-(``\\-``) is a literal, and -- by design -- there is no negation form
-(``[[^...]]`` is not supported).
+``{a, b, c}``); spans may be combined and mixed with literals, and an escaped
+dash (``\\-``) is a literal. A ``^`` as the first character negates the range:
+``[[^\\nabc\\r\\0]]`` matches any character *except* the six listed, emitted as
+a ``ctll::neg_set`` just like a named ``sigma -`` set. A ``^`` that is escaped
+(``\\^``) or not in first position is an ordinary literal.
 
 Rule bodies further support regex-style *grouping* and *repetition*. A
 parenthesized grouping ``(<expr> x)`` brackets a sequence of symbols (separated
@@ -611,42 +613,50 @@ def unescape_character(char: str) -> str:
     return char[1]
 
 
-def expand_range_token(token: str) -> set:
+def expand_range_token(token: str) -> tuple:
     r"""Enumerate a regex-style ``[[...]]`` range token into a set of characters.
 
-    The token includes the surrounding ``[[`` and ``]]``. Its body is read left to
-    right as a sequence of items, each either a single (optionally backslash-
-    escaped) character or a ``start-end`` span. A span enumerates every character
-    whose code point lies between ``start`` and ``end`` inclusive; the endpoints
-    may themselves be escaped (e.g. ``\]-\^``). A literal ``-`` is produced when it
+    The token includes the surrounding ``[[`` and ``]]``. A ``^`` as the very
+    first body character negates the range: the range then denotes every
+    character *except* the listed ones (an escaped ``\^``, or a ``^`` anywhere
+    else, is an ordinary literal). The rest of the body is read left to right as
+    a sequence of items, each either a single (optionally backslash-escaped)
+    character or a ``start-end`` span. A span enumerates every character whose
+    code point lies between ``start`` and ``end`` inclusive; the endpoints may
+    themselves be escaped (e.g. ``\]-\^``). A literal ``-`` is produced when it
     is escaped (``\-``) or appears where it cannot start a span -- at the very end
     of the body, or immediately after a completed span.
 
     Examples::
 
-        [[a-z]]        -> {a, b, ..., z}
-        [[abcg-i]]     -> {a, b, c, g, h, i}
-        [[a-zA-Z]]     -> {a..z, A..Z}
-        [[0-9_]]       -> {0..9, _}
-
-    There is deliberately no support for negation (``[[^...]]``): a range only ever
-    denotes the positive set of characters it lists.
+        [[a-z]]        -> ({a, b, ..., z}, False)
+        [[abcg-i]]     -> ({a, b, c, g, h, i}, False)
+        [[a-zA-Z]]     -> ({a..z, A..Z}, False)
+        [[0-9_]]       -> ({0..9, _}, False)
+        [[^\nabc\r\0]] -> ({\n, a, b, c, \r, \0}, True)  i.e. none of these
 
     Args:
         token: The full range token, including ``[[`` and ``]]``.
 
     Returns:
-        The set of characters the range denotes.
+        A ``(chars, negated)`` pair: the set of characters the range lists, and
+        whether the range is negated (matches the complement of that set).
 
     Raises:
         ValueError: If the token is not delimited by ``[[`` / ``]]``, its body is
-            empty, or a span's start code point exceeds its end.
+            empty (``[[]]`` or ``[[^]]``), or a span's start code point exceeds
+            its end.
     """
     if not (token.startswith("[[") and token.endswith("]]")):
         raise ValueError(f"Malformed range token: {token!r}")
     body = token[2:-2]
+    negated = body.startswith("^")
+    if negated:
+        body = body[1:]
     if not body:
-        raise ValueError("Empty range '[[]]' is not allowed")
+        raise ValueError(
+            "Empty negated range '[[^]]' is not allowed" if negated
+            else "Empty range '[[]]' is not allowed")
 
     # Tokenize the body into characters, decoding backslash escapes, while
     # remembering which characters came from an escape so an escaped '-' is never
@@ -683,7 +693,7 @@ def expand_range_token(token: str) -> set:
         else:
             chars.add(char)
             index += 1
-    return chars
+    return chars, negated
 
 
 # ======================================================================== #
@@ -736,8 +746,8 @@ grammar = r"""
     string: "\"" TEXT "\""
     atom: ATOM
     # A regex-style character range, e.g. [[a-zA-Z]] or [[abcg-i]]. It expands to a
-    # positive set with every member character enumerated. Range negation ([[^...]])
-    # is intentionally not supported.
+    # positive set with every member character enumerated. A leading '^' negates
+    # the range ([[^abc]] matches any character except a, b, c).
     range: RANGE
     TEXT: /((\\.)|[^"])+/
     non_terminal: "<" NAME ">"
@@ -803,7 +813,9 @@ Rules
   <B>        reference to nonterminal B   (names must be 2+ characters)
   x          a single literal character (an atom)
   "abc"      a string literal (expands to atoms a, b, c)
-  [[a-z]]    a regex-style range (expands to a positive set; no negation)
+  [[a-z]]    a regex-style range (expands to a positive set)
+  [[^abc]]   a negated range: any character except those listed; a leading
+             '^' negates, an escaped '\\^' or non-leading '^' is a literal
   [act]      a semantic action named 'act'
   |          separates alternatives
   ,          separates the symbols of one alternative
@@ -1002,16 +1014,20 @@ class RuleTransformer(Transformer):
         ``non_terminal``, ``semantic_action`` or ``epsilon``) is also a
         :class:`SymbolType` member (except ``range``, handled specially), so the
         type is recovered by ``getattr``. Atom values are unescaped first; a
-        ``range`` token is enumerated into an inline positive set. Nodes that a
+        ``range`` token is enumerated into an inline positive set (or a
+        negative set for ``[[^...]]``). Nodes that a
         deeper transform already turned into a :class:`GrammerType` (groups,
         quantified symbols, group atoms) pass through unchanged.
         """
         if isinstance(node, GrammerType):
             return node
         if node.data == "range":
-            # [[a-z]] -> an inline positive set with members enumerated.
-            chars = expand_range_token(node.children[0].value)
-            return GrammerType(chars, SymbolType.positive_set)
+            # [[a-z]] -> an inline positive set with members enumerated;
+            # [[^abc]] -> an inline negative set (any character but these).
+            chars, negated = expand_range_token(node.children[0].value)
+            polarity = (SymbolType.negitive_set if negated
+                        else SymbolType.positive_set)
+            return GrammerType(chars, polarity)
         value = node.children[0].value
         if node.data == "atom":
             value = unescape_character(value)
@@ -1360,8 +1376,15 @@ def get_indexed_nonterminals(productions, table: IdentifierTable) -> set:
             chars |= get_indexed_nonterminals(table[SymbolType.non_terminal][item.value], table)
         elif item.is_atom():
             chars.add(item)
-        elif item.is_set() or item.is_named_terminal():
+        elif item.is_named_terminal():
             chars |= set(table[SymbolType.terminal][item.value].value)
+        elif item.is_set():
+            # An inline [[range]]: its members are stored directly in the symbol.
+            if item.type == SymbolType.negitive_set:
+                raise Exception(
+                    "A negated range [[^...]] cannot appear alongside 'other' "
+                    "(its first-characters cannot be enumerated)")
+            chars |= set(item.value)
     return chars
 
 
@@ -1402,8 +1425,15 @@ def get_other(table: IdentifierTable) -> set:
                     other |= resolved
                 elif item.is_atom():
                     other.add(item.value)
-                elif item.is_set() or item.is_named_terminal():
+                elif item.is_named_terminal():
                     other |= set(table[SymbolType.terminal][item.value].value)
+                elif item.is_set():
+                    # An inline [[range]]: members live in the symbol itself.
+                    if item.type == SymbolType.negitive_set:
+                        raise Exception(
+                            "A negated range [[^...]] cannot appear alongside "
+                            "'other' (its members cannot be enumerated)")
+                    other |= set(item.value)
                 elif item.is_epsilon():
                     continue
                 else:
@@ -2665,6 +2695,24 @@ class TerminalAliaser:
         chosen.sort(key=lambda pair: pair[0])
         return "__".join(name for _key, name in chosen)
 
+    def _base_from_charset(self, charset: frozenset) -> str:
+        """Derive an alias base name from a set of member characters.
+
+        A set matching a ``.gram``-declared terminal reuses that name; a single
+        character is named after itself; otherwise the set is named after the
+        parent terminals whose union it is (a synthesized/factored set), falling
+        back to a short ``set_<n>`` when that composition would be unwieldy.
+        """
+        if charset in self._charset_to_gram_name:
+            return self._charset_to_gram_name[charset]
+        if len(charset) == 1:
+            return _identifier_for_char(next(iter(charset)))
+        composed = self._compose_set_name(charset)
+        if len(composed) <= _MAX_COMPOSED_SET_NAME:
+            return composed
+        self._set_counter += 1
+        return f"set_{self._set_counter}"
+
     def alias_for(self, type_string: str, chars, is_neg: bool, gram_name: str = None) -> str:
         """Return the alias for a rendered terminal, recording it if new.
 
@@ -2674,8 +2722,9 @@ class TerminalAliaser:
             is_neg: Whether the terminal is a negative set.
             gram_name: For a negative set, the name it was defined under in the
                 ``.gram`` (``"other"`` for the implicit global set, or a user name
-                like ``uchar``). Positive terminals leave this ``None`` and are
-                named from their character set instead.
+                like ``uchar``); ``None`` for an anonymous inline ``[[^...]]``
+                range, which is named ``not_<members>``. Positive terminals leave
+                this ``None`` and are named from their character set instead.
 
         Returns:
             The C++ identifier to use in place of ``type_string``.
@@ -2687,26 +2736,16 @@ class TerminalAliaser:
         charset = frozenset(chars)
         if is_neg:
             # The implicit global "other" set is ``_others``; a user-named negative
-            # set (e.g. ``uchar``) keeps its own name.
-            if gram_name in (None, "other"):
+            # set (e.g. ``uchar``) keeps its own name; an anonymous inline
+            # ``[[^...]]`` range is named after its members with a ``not_`` prefix.
+            if gram_name == "other":
                 base = self.others_name
-            else:
+            elif gram_name is not None:
                 base = gram_name
-        elif charset in self._charset_to_gram_name:
-            base = self._charset_to_gram_name[charset]
-        elif len(charset) == 1:
-            base = _identifier_for_char(next(iter(charset)))
-        else:
-            # A synthesized (factored) set: name it after the parent terminals
-            # whose union it is. When that composition does not collapse to a few
-            # named terminals and would be unwieldy, fall back to a short
-            # ``set_<n>`` name instead.
-            composed = self._compose_set_name(charset)
-            if len(composed) <= _MAX_COMPOSED_SET_NAME:
-                base = composed
             else:
-                self._set_counter += 1
-                base = f"set_{self._set_counter}"
+                base = "not_" + self._base_from_charset(charset)
+        else:
+            base = self._base_from_charset(charset)
 
         alias = self._unique(base, type_string)
         self._type_to_alias[type_string] = alias
@@ -2942,7 +2981,9 @@ def render_terminal_lookahead(terminal: GrammerType, terminal_table: dict,
         type_string = render_neg_set(terminal.value)
         if aliaser is not None:
             return aliaser.alias_for(type_string, terminal.value, is_neg=True, gram_name=name)
-        if name == "other" or name is None:
+        # Only the implicit global set collapses to the ``_others`` alias; a
+        # user-named set or an inline ``[[^...]]`` range renders its own type.
+        if name == "other":
             return others_name
         return type_string
 
@@ -3215,7 +3256,10 @@ def _emit_rules_for_nonterminal(nonterminal, entries: dict, terminal_table: dict
                 resolved = looked_up
 
         if resolved.type == SymbolType.negitive_set:
-            if name == "other" or name is None:
+            # Only the implicit global set becomes the ``_others`` lookahead; a
+            # user-named set or an inline ``[[^...]]`` range (name is None) is a
+            # negative set of its own.
+            if name == "other":
                 group_has_others[rhs] = True
             else:
                 entry = (tuple(resolved.value), name)
@@ -3814,29 +3858,31 @@ class RangeExpansionTests(unittest.TestCase):
     def test_simple_span(self):
         """``[[a-z]]`` enumerates the full lowercase span."""
         self.assertEqual(expand_range_token("[[a-z]]"),
-                         set("abcdefghijklmnopqrstuvwxyz"))
+                         (set("abcdefghijklmnopqrstuvwxyz"), False))
 
     def test_mixed_literals_and_span(self):
         """``[[abcg-i]]`` mixes literal characters and a span."""
-        self.assertEqual(expand_range_token("[[abcg-i]]"), set("abcghi"))
+        self.assertEqual(expand_range_token("[[abcg-i]]"),
+                         (set("abcghi"), False))
 
     def test_multiple_spans(self):
         """``[[a-zA-Z]]`` enumerates two spans into one set."""
         self.assertEqual(expand_range_token("[[a-zA-Z]]"),
-                         set("abcdefghijklmnopqrstuvwxyz"
-                             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+                         (set("abcdefghijklmnopqrstuvwxyz"
+                              "ABCDEFGHIJKLMNOPQRSTUVWXYZ"), False))
 
     def test_span_then_literal(self):
         """A span can be followed by literals (``[[0-9_]]``)."""
-        self.assertEqual(expand_range_token("[[0-9_]]"), set("0123456789_"))
+        self.assertEqual(expand_range_token("[[0-9_]]"),
+                         (set("0123456789_"), False))
 
     def test_escaped_dash_is_literal(self):
         """An escaped dash (``\\-``) is a literal, not a span separator."""
-        self.assertEqual(expand_range_token(r"[[a\-c]]"), set("a-c"))
+        self.assertEqual(expand_range_token(r"[[a\-c]]"), (set("a-c"), False))
 
     def test_single_character(self):
         """A one-character range is just that character."""
-        self.assertEqual(expand_range_token("[[x]]"), {"x"})
+        self.assertEqual(expand_range_token("[[x]]"), ({"x"}, False))
 
     def test_reversed_span_raises(self):
         """A span whose start follows its end is rejected."""
@@ -3847,6 +3893,32 @@ class RangeExpansionTests(unittest.TestCase):
         """An empty ``[[]]`` is rejected."""
         with self.assertRaises(ValueError):
             expand_range_token("[[]]")
+
+    def test_negated_range(self):
+        """A leading ``^`` negates the range."""
+        self.assertEqual(expand_range_token("[[^abc]]"), (set("abc"), True))
+
+    def test_negated_range_with_escapes(self):
+        """Negation combines with escaped characters (``[[^\\nabc\\r\\0]]``)."""
+        self.assertEqual(expand_range_token(r"[[^\nabc\r\0]]"),
+                         ({"\n", "a", "b", "c", "\r", "\0"}, True))
+
+    def test_negated_span(self):
+        """Negation combines with spans (``[[^a-c]]``)."""
+        self.assertEqual(expand_range_token("[[^a-c]]"), (set("abc"), True))
+
+    def test_escaped_caret_is_literal(self):
+        """An escaped leading ``\\^`` is a literal, not negation."""
+        self.assertEqual(expand_range_token(r"[[\^ab]]"), (set("^ab"), False))
+
+    def test_non_leading_caret_is_literal(self):
+        """A ``^`` after the first position is an ordinary literal."""
+        self.assertEqual(expand_range_token("[[a^b]]"), (set("a^b"), False))
+
+    def test_empty_negated_range_raises(self):
+        """A negation with nothing to negate (``[[^]]``) is rejected."""
+        with self.assertRaises(ValueError):
+            expand_range_token("[[^]]")
 
     def test_range_in_rule_becomes_set(self):
         """A range in a rule body is emitted as an enumerated ctll::set."""
@@ -3864,6 +3936,25 @@ class RangeExpansionTests(unittest.TestCase):
         # Single brackets remain semantic actions; double brackets are ranges.
         cpp = _generate_cpp("tok={a}\nSt->tok,[act],<St>|epsilon\n")
         self.assertIn("struct act: ctll::action", cpp)
+
+    def test_negated_range_in_rule_becomes_neg_set(self):
+        """A ``[[^...]]`` range in a rule body is emitted as a ctll::neg_set."""
+        cpp = _generate_cpp("St->[[^abc]],<St>|epsilon\n")
+        self.assertIn("ctll::neg_set<'a','b','c'>", cpp)
+
+    def test_negated_range_matches_named_negative_set(self):
+        """An inline ``[[^x,y]]`` behaves like a named ``sigma - {x,y}`` set."""
+        inline = _generate_cpp("St->[[^xy]],<St>|epsilon\n")
+        self.assertIn("ctll::neg_set<'x','y'>", inline)
+
+    def test_negated_range_quantified(self):
+        """A negated range takes a quantifier like any other symbol."""
+        table = _build_identifier_table("St->a,[[^bc]]+,d\n")
+        rules = table[SymbolType.non_terminal]
+        helper = next(n for n in rules if n.endswith("_anon"))
+        body = next(iter(rules[helper]))
+        self.assertEqual(body[0].type, SymbolType.negitive_set)
+        self.assertEqual(body[0].value, {"b", "c"})
 
 
 class SetDefinitionSyntaxTests(unittest.TestCase):
