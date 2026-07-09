@@ -71,6 +71,28 @@ positive set with every member character enumerated (``[[a-c]]`` becomes the set
 (``\\-``) is a literal, and -- by design -- there is no negation form
 (``[[^...]]`` is not supported).
 
+Rule bodies further support regex-style *grouping* and *repetition*. A
+parenthesized grouping ``(<expr> x)`` brackets a sequence of symbols (separated
+by commas or just whitespace), and the quantifiers ``+`` (one or more) and ``*``
+(zero or more) may follow an atom, a ``"string"``, a ``[[range]]``, a named
+terminal, a ``<nonterminal>`` or a grouping. Both are pure syntax sugar,
+rewritten before any analysis into an anonymous right-recursive helper::
+
+    S -> a+        becomes    S -> a, <a_anon>
+                              a_anon -> a, <a_anon> | @
+
+    S -> a*        becomes    S -> <a_anon>
+                              a_anon -> a, <a_anon> | @
+
+Because ``( ) * +`` are also ordinary characters in many grammars, the sugar is
+recognized only where it is structurally unambiguous: a ``*`` or ``+`` is a
+quantifier only when it immediately follows a quantifiable symbol (so the
+stand-alone atoms in ``S -> (, a, ), *`` keep their old meaning), and inside a
+grouping -- where whitespace alone separates items -- the structural characters
+``, ( ) < > [ ] | " * + @`` must be escaped (``\\(``, ``\\*``, ...) to be
+literals. Outside groupings nothing changes and existing grammars parse as
+before.
+
 Parser model
 ------------
 By default Tablewright targets a *Q-grammar*, the relaxation CTLL relies on: when
@@ -352,6 +374,13 @@ class SymbolType(Enum):
     positive_set = auto()   # set polarity: match one of these characters
     negitive_set = auto()   # set polarity: match any character except these
     action = auto()         # identifier-table key for the set of action names
+    # The next two are *transient* symbol kinds produced by the parser for the
+    # regex-style grouping/repetition syntax. They exist only between the tree
+    # transform and expand_groups_and_quantifiers(), which rewrites every one of
+    # them into ordinary symbols (splicing groups inline and turning '+'/'*'
+    # into anonymous helper nonterminals) before any analysis or generation.
+    group = auto()          # ( ... ): value is a tuple of the grouped symbols
+    quantified = auto()     # X+ / X*: value is (tuple of symbols, '+' or '*')
 
 
 class HashableList(UserList):
@@ -672,10 +701,36 @@ grammar = r"""
     rule_list: rule ("|" rule)*
     rule: epsilon_empty | ((SINGLE_NAME ":")? rule_content)
     rule_content: rule_atom ("," rule_atom)* ","?
-    rule_atom: epsilon | atom | string | range | terminal | non_terminal | semantic_action
+    rule_atom: epsilon | atom | string | range | terminal | non_terminal | semantic_action | group | quantified
     epsilon: (EPSILON_AT|EPSILON)
     # Empty rule can signify epsilon
     epsilon_empty:
+
+    // Regex-style repetition: '+' (one or more) and '*' (zero or more) may follow
+    // an atom, a "string", a [[range]], a named terminal, a <nonterminal> or a
+    // (grouping). Both are expanded into an anonymous helper nonterminal before
+    // any analysis runs (see expand_groups_and_quantifiers). A '*' or '+' that
+    // does not immediately follow such a symbol -- e.g. one standing alone
+    // between commas, as in ``S -> a, *, b`` -- is still an ordinary atom, so
+    // existing grammars that use these characters as terminals keep working.
+    quantified: quant_base QUANT
+    quant_base: atom | string | range | terminal | non_terminal | group
+
+    // A parenthesized grouping, e.g. ``(<expr> x)`` or ``(<expr>, x)*``. Its
+    // items may be separated by commas or simply by whitespace. Because bare
+    // whitespace separates items, the structural characters , ( ) < > [ ] | " * +
+    // and @ must be written escaped (\( \* ...) to mean their literal selves
+    // *inside* a grouping; outside a grouping the comma-separated syntax is
+    // unchanged and those characters remain plain atoms (``S -> (, a, )`` is
+    // still the three atoms '(' 'a' ')'). group_atom's lower priority makes a
+    // multi-character word inside a grouping resolve as a NAME (a named-terminal
+    // reference), matching what it means at top level.
+    group: "(" group_content ")"
+    group_content: group_item (","? group_item)* ","?
+    group_item: epsilon | group_atom | string | range | terminal | non_terminal | semantic_action | group | group_quantified
+    group_quantified: group_quant_base QUANT
+    group_quant_base: group_atom | string | range | terminal | non_terminal | group
+    group_atom.-1: GATOM
 
     terminal: NAME | "*" NAME | NAME EPSILON_AT ATOM
     string: "\"" TEXT "\""
@@ -713,6 +768,12 @@ grammar = r"""
     NAME: /[a-zA-Z][a-zA-Z_0-9]+/
     EPSILON_AT: /(?<!\\)@/
     EPSILON: "epsilon"
+    # A repetition quantifier ('one or more' / 'zero or more').
+    QUANT: "+" | "*"
+    # An atom inside a (grouping): any single character except unescaped
+    # whitespace or the grouping's structural characters; escapes lift the
+    # restriction (e.g. \( \) \* \+ \, are the literal characters).
+    GATOM: /\\.|[^\s,()<>\[\]|"*+@]/
     ATOM: /\\?[^\s]/
     SPACES: /[ \t\f]+/
     WHITESPACES: /\s+/ 
@@ -748,6 +809,20 @@ Rules
   ,          separates the symbols of one alternative
   epsilon    (or '@') the empty production
 
+Repetition and grouping
+-----------------------
+  X+         one or more X:   S -> a+   =   S -> a, <a_anon>
+                                            a_anon -> a, <a_anon> | @
+  X*         zero or more X:  S -> a*   =   S -> <a_anon>  (same helper)
+  (X Y)      groups a sequence; items separated by commas or whitespace
+  (X Y)*     a grouping may itself be quantified
+
+  X may be an atom, "string", [[range]], named terminal, <nonterminal>,
+  or (grouping). A '*' or '+' is a quantifier only right after such a
+  symbol; standing alone (e.g. 'S -> a, *, b') it is still a plain atom.
+  Inside a grouping, escape , ( ) < > [ ] | " * + @ to use them as
+  literal characters (\\(, \\*, ...).
+
 Notes
 -----
   * '#' starts a comment to end of line.
@@ -777,12 +852,21 @@ _TOKEN_DESCRIPTIONS = {
     "NAME": "a terminal/nonterminal name",
     "SINGLE_NAME": "a name",
     "ATOM": "a character",
+    "GATOM": "a character",
+    "QUANT": "'+' or '*'",
+    "STAR": "'*'",
+    "PLUS": "'+'",
     "EPSILON": "'epsilon'",
     "EPSILON_AT": "'@'",
     "TEXT": "a quoted string",
     "RANGE": "a [[a-z]] range",
     "LPAR": "'('",
     "RPAR": "')'",
+    "DBLQUOTE": "'\"'",
+    "LESSTHAN": "'<'",
+    "MORETHAN": "'>'",
+    "LSQB": "'['",
+    "RSQB": "']'",
 }
 
 
@@ -903,27 +987,78 @@ class SpaceTransformer(Transformer):
 
 
 class RuleTransformer(Transformer):
-    """Turn ``rule_atom`` and ``rule`` subtrees into symbols and productions."""
+    """Turn ``rule_atom`` and ``rule`` subtrees into symbols and productions.
 
-    def rule_atom(self, tree: Tree) -> GrammerType:
-        """Build the :class:`GrammerType` for one symbol of a rule body.
+    Grouping (``(...)``) and repetition (``X+`` / ``X*``) nodes become symbols
+    of the transient :class:`SymbolType` kinds ``group`` and ``quantified``;
+    :func:`expand_groups_and_quantifiers` rewrites those away immediately after
+    the identifier table is built.
+    """
+
+    def _inner_symbol(self, node) -> GrammerType:
+        """Build the :class:`GrammerType` for one inner symbol node.
 
         The inner node's name (``atom``, ``string``, ``range``, ``terminal``,
         ``non_terminal``, ``semantic_action`` or ``epsilon``) is also a
         :class:`SymbolType` member (except ``range``, handled specially), so the
         type is recovered by ``getattr``. Atom values are unescaped first; a
-        ``range`` token is enumerated into an inline positive set.
+        ``range`` token is enumerated into an inline positive set. Nodes that a
+        deeper transform already turned into a :class:`GrammerType` (groups,
+        quantified symbols, group atoms) pass through unchanged.
         """
-        rule_atom = tree[0]
-        if rule_atom.data == "range":
+        if isinstance(node, GrammerType):
+            return node
+        if node.data == "range":
             # [[a-z]] -> an inline positive set with members enumerated.
-            chars = expand_range_token(rule_atom.children[0].value)
+            chars = expand_range_token(node.children[0].value)
             return GrammerType(chars, SymbolType.positive_set)
-        value = rule_atom.children[0].value
-        if rule_atom.data == "atom":
+        value = node.children[0].value
+        if node.data == "atom":
             value = unescape_character(value)
-        symbol_type = getattr(SymbolType, rule_atom.data)
+        symbol_type = getattr(SymbolType, node.data)
         return GrammerType(value, symbol_type)
+
+    def rule_atom(self, tree: Tree) -> GrammerType:
+        """Build the :class:`GrammerType` for one symbol of a rule body."""
+        return self._inner_symbol(tree[0])
+
+    # A grouping's items use the same symbol kinds as a rule body (with the
+    # restricted GATOM as the atom terminal), so they convert identically.
+    group_item = rule_atom
+
+    def group_atom(self, tree) -> GrammerType:
+        """An atom inside a grouping (``GATOM``): unescape it like ``atom``."""
+        return GrammerType(unescape_character(tree[0].value), SymbolType.atom)
+
+    def group_content(self, tree) -> tuple:
+        """Collect a grouping's items (already :class:`GrammerType`) in order."""
+        return tuple(tree)
+
+    def group(self, tree) -> GrammerType:
+        """Build the transient ``group`` symbol; its value is the item tuple."""
+        return GrammerType(tree[0], SymbolType.group)
+
+    def _quantified(self, tree) -> GrammerType:
+        """Build the transient ``quantified`` symbol for ``X+`` / ``X*``.
+
+        Its value is ``(body, quant)`` where ``body`` is the tuple of symbols
+        being repeated (a quantified group contributes its items directly, so
+        ``(a b)*`` repeats the two-symbol sequence) and ``quant`` is ``'+'`` or
+        ``'*'``.
+        """
+        base = self._inner_symbol(tree[0])
+        quant = tree[1].value
+        body = base.value if base.type == SymbolType.group else (base,)
+        return GrammerType((tuple(body), quant), SymbolType.quantified)
+
+    quantified = _quantified
+    group_quantified = _quantified
+
+    def quant_base(self, tree) -> GrammerType:
+        """Unwrap the symbol a quantifier applies to."""
+        return self._inner_symbol(tree[0])
+
+    group_quant_base = quant_base
 
     def rule(self, tok) -> HashableList:
         """Build one production (a :class:`HashableList` of symbols).
@@ -1023,6 +1158,155 @@ def add_semantic_action_identifiers(table: IdentifierTable) -> None:
                 if symbol.is_semantic_action():
                     actions.add(symbol.value)
     table[SymbolType.action] = actions
+
+
+def _anonymous_helper_name(body, taken) -> str:
+    """Derive a readable, unique nonterminal name for a repetition helper.
+
+    The name is built from the repeated body so the generated grammar stays
+    self-describing: ``a+`` gets ``a_anon`` (matching the documented expansion),
+    ``<expr>*`` gets ``expr_anon``, and a multi-symbol body such as ``(a b)+``
+    joins its first symbols (``a_b_anon``). Characters that are not valid in an
+    identifier are spelled as ``xNN`` hex escapes so the name survives into the
+    generated C++; a numeric suffix guarantees uniqueness against ``taken``.
+
+    Args:
+        body: The tuple of symbols being repeated.
+        taken: Names already in use (nonterminals, terminals, prior helpers).
+
+    Returns:
+        A fresh name ending in ``_anon`` (or ``_anonN``).
+    """
+    def sanitize(symbol) -> str:
+        value = symbol.value
+        if not isinstance(value, str):
+            return "set"  # an inline [[range]] / character set
+        cleaned = "".join(
+            ch if (ch.isalnum() or ch == "_") else f"x{ord(ch):02X}"
+            for ch in value
+        )
+        return cleaned or "sym"
+
+    base = "_".join(sanitize(symbol) for symbol in body[:2])
+    if len(body) > 2:
+        base += "_seq"
+    # Helper names appear verbatim as C++ identifiers, so avoid the reserved
+    # shapes: collapse '__' runs and never start with '_' or a digit.
+    while "__" in base:
+        base = base.replace("__", "_")
+    base = base.lstrip("_")
+    if not base:
+        base = "group"
+    if base[0].isdigit():
+        base = "n" + base
+    name = f"{base}_anon"
+    suffix = 2
+    while name in taken:
+        name = f"{base}_anon{suffix}"
+        suffix += 1
+    return name
+
+
+def expand_groups_and_quantifiers(table: IdentifierTable) -> int:
+    """Rewrite grouping and ``+``/``*`` repetition syntax into plain rules.
+
+    Runs right after the identifier table is built, before anything else looks
+    at the grammar, and removes every transient ``group`` / ``quantified``
+    symbol the parser produced:
+
+    * A bare grouping ``(X Y)`` is spliced inline: it is only bracketing.
+    * ``body+`` (one or more) becomes ``body, <body_anon>``.
+    * ``body*`` (zero or more) becomes ``<body_anon>``.
+
+    where the shared helper is the right-recursive loop::
+
+        body_anon -> body, <body_anon> | epsilon
+
+    so, per the documented example, ``S -> a+`` becomes ``S -> a, <a_anon>``
+    with ``a_anon -> a, <a_anon> | epsilon``, and ``S -> a*`` becomes
+    ``S -> <a_anon>`` with the same helper (equivalent to the
+    ``S -> a, a_anon | @`` form: the helper alone already derives epsilon).
+    Right recursion keeps the result (q)LL(1)-friendly and needs no further
+    left-recursion elimination. Identical repeated bodies share one helper, and
+    nesting (``((a)*)+``) is expanded innermost-first.
+
+    Args:
+        table: The identifier table; its nonterminal section is rewritten in
+            place and gains one helper nonterminal per distinct repeated body.
+
+    Returns:
+        The number of helper nonterminals created.
+    """
+    nonterminals = table[SymbolType.non_terminal]
+    taken = set(nonterminals) | set(table[SymbolType.terminal])
+    helpers = {}      # body tuple -> helper name (for reuse)
+    helper_defs = {}  # helper name -> OrderedSet of its two productions
+
+    def helper_for(body: tuple) -> str:
+        """Return (creating on first use) the loop helper for ``body``."""
+        if body in helpers:
+            return helpers[body]
+        name = _anonymous_helper_name(body, taken)
+        taken.add(name)
+        helpers[body] = name
+        loop = HashableList(list(body)
+                            + [GrammerType(name, SymbolType.non_terminal)])
+        empty = HashableList([GrammerType("epsilon", SymbolType.epsilon)])
+        helper_defs[name] = OrderedSet([loop, empty])
+        trace(f"repetition helper: {name} -> "
+              f"{' '.join(str(s) for s in body)} <{name}> | epsilon")
+        return name
+
+    def expand_symbols(symbols) -> list:
+        """Expand groups/quantifiers in a symbol sequence, innermost first."""
+        expanded = []
+        for symbol in symbols:
+            if symbol.type == SymbolType.group:
+                expanded.extend(expand_symbols(symbol.value))
+            elif symbol.type == SymbolType.quantified:
+                inner, quant = symbol.value
+                body = [s for s in expand_symbols(inner) if not s.is_epsilon()]
+                if not body:
+                    continue  # (epsilon)* / (epsilon)+ repeat nothing
+                name = helper_for(tuple(body))
+                if quant == "+":
+                    expanded.extend(body)
+                expanded.append(GrammerType(name, SymbolType.non_terminal))
+            else:
+                expanded.append(symbol)
+        return expanded
+
+    rewrites = 0
+    for name, productions in list(nonterminals.items()):
+        new_productions = OrderedSet()
+        for production in productions:
+            has_transient = any(
+                s.type in (SymbolType.group, SymbolType.quantified)
+                for s in production
+            )
+            if not has_transient:
+                new_productions.add(production)
+                continue
+            symbols = expand_symbols(production)
+            # A production reduced to nothing (e.g. only epsilon-bodied
+            # repetitions) is the empty production.
+            if not symbols:
+                symbols = [GrammerType("epsilon", SymbolType.epsilon)]
+            # An epsilon is meaningful only when it stands alone.
+            if len(symbols) > 1:
+                symbols = [s for s in symbols if not s.is_epsilon()] or symbols
+            new_productions.add(HashableList(symbols))
+            rewrites += 1
+        nonterminals[name] = new_productions
+    nonterminals.update(helper_defs)
+
+    if helper_defs or rewrites:
+        logger.info(
+            f"Expanded grouping/repetition syntax in {rewrites} production(s), "
+            f"adding {len(helper_defs)} helper nonterminal(s): "
+            f"{', '.join(sorted(helper_defs))}"
+        )
+    return len(helper_defs)
 
 
 def break_strings(table: IdentifierTable) -> None:
@@ -3110,6 +3394,7 @@ def _build_identifier_table(gram_text: str) -> IdentifierTable:
     tree = Lark(grammar, start="start").parse(gram_text)
     tree = (SpaceTransformer() * RuleTransformer() * SetTransformer()).transform(tree)
     add_identifers().visit(tree)
+    expand_groups_and_quantifiers(identifier_table)
     add_semantic_action_identifiers(identifier_table)
     verify_identifiers(identifier_table)
     break_strings(identifier_table)
@@ -3677,6 +3962,144 @@ class RuleOperatorSyntaxTests(unittest.TestCase):
         self.assertIn("rule(St,", cpp)
 
 
+class QuantifierGroupTests(unittest.TestCase):
+    """Tests for regex-style groupings ``(...)`` and quantifiers ``+`` / ``*``."""
+
+    def _grammar(self, gram_text):
+        """Front-end pipeline shortcut: return the nonterminal section."""
+        return _build_identifier_table(gram_text)[SymbolType.non_terminal]
+
+    @staticmethod
+    def _bodies(productions):
+        """Render productions as tuples of symbol strings for comparison."""
+        return {tuple(str(s) for s in production) for production in productions}
+
+    def test_plus_expands_to_helper(self):
+        """``S -> a+`` becomes ``S -> a, <a_anon>`` with the loop helper."""
+        g = self._grammar("S -> a+\n")
+        self.assertEqual(self._bodies(g["S"]), {("a", "a_anon")})
+        # The trailing symbol is a real nonterminal reference.
+        self.assertTrue(list(g["S"])[0][-1].is_non_terminal())
+        self.assertEqual(self._bodies(g["a_anon"]),
+                         {("a", "a_anon"), ("epsilon",)})
+
+    def test_star_expands_to_helper(self):
+        """``S -> a*`` becomes ``S -> <a_anon>`` with the same loop helper."""
+        g = self._grammar("S -> a*\n")
+        self.assertEqual(self._bodies(g["S"]), {("a_anon",)})
+        self.assertEqual(self._bodies(g["a_anon"]),
+                         {("a", "a_anon"), ("epsilon",)})
+
+    def test_quantifier_may_be_spaced(self):
+        """``<bb> +`` (whitespace before the quantifier) also quantifies."""
+        g = self._grammar("S -> <bb> +\nbb -> y\n")
+        self.assertEqual(self._bodies(g["S"]), {("bb", "bb_anon")})
+        self.assertEqual(self._bodies(g["bb_anon"]),
+                         {("bb", "bb_anon"), ("epsilon",)})
+
+    def test_bare_group_splices_inline(self):
+        """An unquantified grouping is only bracketing: it splices in place."""
+        g = self._grammar("S -> ( <bb> x )\nbb -> y\n")
+        self.assertEqual(self._bodies(g["S"]), {("bb", "x")})
+
+    def test_group_items_accept_commas(self):
+        """Grouping items may be comma-separated as well as space-separated."""
+        g = self._grammar("S -> (<bb>, x)\nbb -> y\n")
+        self.assertEqual(self._bodies(g["S"]), {("bb", "x")})
+
+    def test_quantified_group(self):
+        """``(<bb>)*`` repeats the grouped sequence via one helper."""
+        g = self._grammar("S -> (<bb>)*\nbb -> y\n")
+        self.assertEqual(self._bodies(g["S"]), {("bb_anon",)})
+        self.assertEqual(self._bodies(g["bb_anon"]),
+                         {("bb", "bb_anon"), ("epsilon",)})
+
+    def test_quantified_multi_symbol_group(self):
+        """``(a, b)+`` repeats the whole two-symbol sequence."""
+        g = self._grammar("S -> (a, b)+, c\n")
+        self.assertEqual(self._bodies(g["S"]), {("a", "b", "a_b_anon", "c")})
+        self.assertEqual(self._bodies(g["a_b_anon"]),
+                         {("a", "b", "a_b_anon"), ("epsilon",)})
+
+    def test_identical_bodies_share_a_helper(self):
+        """``a*`` and ``a+`` in one grammar reuse the same loop helper."""
+        g = self._grammar("S -> a*, a+\n")
+        self.assertEqual(self._bodies(g["S"]), {("a_anon", "a", "a_anon")})
+        helpers = [name for name in g if str(name).endswith("_anon")]
+        self.assertEqual(helpers, ["a_anon"])
+
+    def test_nested_quantifiers(self):
+        """Nesting expands innermost-first: ``((a)*)+`` builds two helpers."""
+        g = self._grammar("S -> ((a)*)+\n")
+        self.assertEqual(self._bodies(g["S"]), {("a_anon", "a_anon_anon")})
+        self.assertEqual(self._bodies(g["a_anon_anon"]),
+                         {("a_anon", "a_anon_anon"), ("epsilon",)})
+
+    def test_quantified_named_terminal(self):
+        """A named terminal reference can be quantified."""
+        g = self._grammar("tok = {0,1}\nS -> tok+\n")
+        self.assertEqual(self._bodies(g["S"]), {("tok", "tok_anon")})
+
+    def test_quantified_string_breaks_into_atoms(self):
+        """A quantified string still expands into atoms inside the helper."""
+        g = self._grammar('S -> "ab"+\n')
+        self.assertEqual(self._bodies(g["S"]), {("a", "b", "ab_anon")})
+        self.assertEqual(self._bodies(g["ab_anon"]),
+                         {("a", "b", "ab_anon"), ("epsilon",)})
+
+    def test_bare_punctuation_atoms_unchanged(self):
+        """Stand-alone ``( ) * +`` between commas stay ordinary atoms."""
+        g = self._grammar("S -> (, a, ), *, +\n")
+        self.assertEqual(self._bodies(g["S"]), {("(", "a", ")", "*", "+")})
+        production = list(g["S"])[0]
+        self.assertTrue(all(symbol.is_atom() for symbol in production))
+        self.assertFalse(any(str(name).endswith("_anon") for name in g))
+
+    def test_escaped_structural_chars_inside_group(self):
+        """Escapes make ``( ) * + ,`` literal atoms inside a grouping."""
+        g = self._grammar("S -> (\\(, \\*, \\+, \\,, \\))+\n")
+        helper = [name for name in g if str(name).endswith("_anon")][0]
+        loop = self._bodies(g[helper])
+        self.assertIn(("(", "*", "+", ",", ")", str(helper)), loop)
+
+    def test_group_with_semantic_action(self):
+        """Semantic actions ride along inside a quantified grouping."""
+        g = self._grammar("S -> (a [act])+\n")
+        table = identifier_table
+        self.assertIn("act", table[SymbolType.action])
+        self.assertEqual(self._bodies(g["S"]), {("a", "act", "a_act_anon")})
+        # The action keeps its symbol kind through the expansion.
+        production = list(g["S"])[0]
+        self.assertTrue(production[1].is_semantic_action())
+
+    def test_helper_name_avoids_collisions(self):
+        """A generated helper never shadows an existing nonterminal."""
+        g = self._grammar("S -> a+\na_anon -> z\n")
+        names = {str(name) for name in g}
+        self.assertIn("a_anon", names)   # the user's own rule
+        self.assertIn("a_anon2", names)  # the generated helper
+        self.assertEqual(self._bodies(g["S"]), {("a", "a_anon2")})
+
+    def test_generated_cpp_contains_helper(self):
+        """A quantified grammar renders to C++ end to end."""
+        cpp = _generate_cpp("S -> a+\n")
+        self.assertIn("a_anon", cpp)
+        self.assertIn("rule(S,", cpp)
+
+    def test_language_shape_matches_documented_expansion(self):
+        """``a+`` and the hand-written expansion generate identical C++."""
+        sugar = _generate_cpp("S -> a+\n")
+        manual = _generate_cpp(
+            "S -> a, <a_anon>\na_anon -> a, <a_anon> | epsilon\n")
+        self.assertEqual(sugar, manual)
+
+    def test_syntax_reference_mentions_repetition(self):
+        """The --syntax cheat-sheet documents the new sugar."""
+        self.assertIn("one or more", GRAMMAR_SYNTAX_REFERENCE)
+        self.assertIn("zero or more", GRAMMAR_SYNTAX_REFERENCE)
+        self.assertIn("(X Y)", GRAMMAR_SYNTAX_REFERENCE)
+
+
 class RangeLookaheadTests(unittest.TestCase):
     """Tests for the optional ``ctll::range`` lookahead optimization."""
 
@@ -3890,7 +4313,8 @@ def build_test_suite() -> "unittest.TestSuite":
                  TerminalAliaserTests, FirstFollowTests, ParseTableTests,
                  GrammarAnalysisTests, OptimizationTests, IntegrationTests,
                  RangeExpansionTests, SetDefinitionSyntaxTests,
-                 RuleOperatorSyntaxTests, RangeLookaheadTests,
+                 RuleOperatorSyntaxTests, QuantifierGroupTests,
+                 RangeLookaheadTests,
                  QualityOfLifeTests, RegressionTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     return suite
@@ -4373,6 +4797,10 @@ def main() -> None:
 
     with timed_stage("Building identifier table"):
         add_identifers().visit(tree)
+        # Rewrite the regex-style grouping/repetition syntax ((...), '+', '*')
+        # into ordinary rules with anonymous helper nonterminals before anything
+        # else inspects the grammar.
+        expand_groups_and_quantifiers(identifier_table)
         add_semantic_action_identifiers(identifier_table)
         logger.info(
             f"Collected {len(identifier_table[SymbolType.non_terminal])} nonterminals, "
