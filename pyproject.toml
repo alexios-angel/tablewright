@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "desatomat"
+name = "Tablewright"
 version = "0.1.0"
 description = "Open-source implementation of Desatomat and its Extended Desátomatu Syntax."
 readme = "README.md"
