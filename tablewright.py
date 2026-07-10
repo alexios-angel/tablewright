@@ -2875,7 +2875,7 @@ def cpp_char_literal(char: str) -> str:
         A complete C++ character literal for ``char``.
     """
     special = {"(": r"\x28", ")": r"\x29", "{": r"\x7B", "}": r"\x7D",
-               "\\": r"\\", '"': r"\""}
+               "\\": r"\\", '"': r"\"", "'": r"\'"}
     if char in special:
         return f"'{special[char]}'"
     code_point = ord(char)
