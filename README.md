@@ -77,6 +77,34 @@ it exits nonzero if the grammar is invalid:
 ./tablewright --check --input=pcre.gram
 ```
 
+### EBNF and Lark input
+
+Use `--lang` to select the input frontend. The existing Extended Desatomat
+syntax remains the default (`eds`):
+
+```bash
+tablewright --lang=ebnf --input=grammar.ebnf --output=include/
+tablewright --lang=lark --input=grammar.lark --output=include/
+```
+
+The EBNF frontend accepts `name = expression;` rules, quoted literals,
+alternation, grouping, optional expressions (`[...]` or `?`), repetition
+(`{...}`, `*`, and `+`), and `epsilon`/`empty`.
+
+The Lark frontend parses complete grammar documents using the official
+`grammars/lark.lark` specification shipped by the installed Lark package. It
+accepts character-oriented parser rules with quoted literals, grouping,
+alternation, multiline alternatives, aliases, priorities, and `?`/`*`/`+`.
+Uppercase terminals may be a single quoted character or a character-class regex
+such as `DIGIT: /[0-9]/`. `%import`, `%declare`, and `%ignore` declarations are
+parsed as Lark syntax; they do not create a separate runtime lexer because CTLL
+parses characters directly.
+
+Tablewright intentionally rejects Lark terminals that match multi-character
+tokens (for example `WORD: /[a-z]+/`). Such lexer tokens cannot be translated
+faithfully to CTLL's character-at-a-time grammar without changing tokenization
+semantics; express the repetition in a parser rule instead.
+
 ## The `.gram` grammar dialect
 
 A grammar is a sequence of **terminal (set) definitions** and **rules**. Run
@@ -184,6 +212,7 @@ raw parser internals.
 | Option                 | Description                                                                                                |
 | ---------------------- | -------------------------------------------------------------------------------------------------------- |
 | `--input`              | Input grammar file. Use `--input=-` to read from stdin                                                    |
+| `--lang`               | Input syntax: `eds` (default), `ebnf`, or `lark`                                                         |
 | `--output`             | Output directory, or a file path to write directly. Default directory is the current directory            |
 | `--fname` `--cfg:fname`| Output filename (default: derived from the input filename, e.g. `pcre.gram` → `pcre.hpp`)                 |
 | `--namespace` `--cfg:namespace` | C++ namespace to put the grammar in (default: derived from the input filename)                   |

@@ -218,18 +218,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
 import time
 import unittest
 from collections import OrderedDict, UserList, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from io import TextIOWrapper
+from io import TextIOBase
 from pathlib import Path
 from pprint import pformat
 from sys import stdout
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 # Lark parses the .gram input.
 from lark import Discard, Lark, Token, Transformer, Tree, Visitor
@@ -245,8 +244,6 @@ LICENSE = "MIT"
 
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
-logging_level = logging.INFO
-
 # A finer-grained level than DEBUG for very chatty, per-item tracing (individual
 # FIRST/FOLLOW additions, every parse-table cell, every alias assignment). It sits
 # just below DEBUG so ``--trace`` is strictly more verbose than ``--verbose``.
@@ -1052,6 +1049,314 @@ def parse_grammar_text(source: str, filename: str = "<grammar>"):
         return parser.parse(source)
     except UnexpectedInput as exc:
         raise ValueError(format_grammar_syntax_error(exc, source, filename)) from exc
+
+
+_EXTERNAL_EXPRESSION_GRAMMAR = r"""
+    ebnf: rule+
+    rule: NAME "=" alternatives ";"
+    expression: alternatives
+    alternatives: sequence ("|" sequence)*
+    sequence: factor (","? factor)* ","? |
+    factor: atom QUANT?
+    ?atom: NAME                 -> name
+         | STRING               -> literal
+         | "(" alternatives ")" -> group
+         | "[" alternatives "]" -> optional
+         | "{" alternatives "}" -> repeat
+
+    QUANT: "?" | "*" | "+"
+    NAME: /[A-Za-z_][A-Za-z_0-9]*/
+    STRING: /"(\\.|[^"\\])*"|'(\\.|[^'\\])*'/
+    EBNF_COMMENT: /\(\*(.|\n)*?\*\)/
+    %ignore EBNF_COMMENT
+    %import common.WS
+    %ignore WS
+"""
+
+_EXTERNAL_EXPRESSION_PARSER = Lark(
+    _EXTERNAL_EXPRESSION_GRAMMAR,
+    parser="lalr",
+    start=["ebnf", "expression"],
+)
+
+
+class ExternalExpressionTransformer(Transformer):
+    """Turn Lark's EBNF/expression parse tree into the frontend AST."""
+
+    def name(self, children):
+        return ("name", str(children[0]))
+
+    def literal(self, children):
+        return ("literal", str(children[0]))
+
+    def sequence(self, children):
+        return ("seq", list(children))
+
+    def alternatives(self, children):
+        return ("alt", list(children))
+
+    def factor(self, children):
+        node = children[0]
+        return ("quant", node, str(children[1])) if len(children) == 2 else node
+
+    def group(self, children):
+        return children[0]
+
+    def optional(self, children):
+        return ("quant", children[0], "?")
+
+    def repeat(self, children):
+        return ("quant", children[0], "*")
+
+    def expression(self, children):
+        return children[0]
+
+    def rule(self, children):
+        return (str(children[0]), children[1])
+
+    def ebnf(self, children):
+        return list(children)
+
+
+def _parse_external_expression(source: str):
+    """Parse an EBNF-style expression with Lark and return its frontend AST."""
+    try:
+        tree = _EXTERNAL_EXPRESSION_PARSER.parse(source, start="expression")
+    except UnexpectedInput as exc:
+        raise ValueError(format_grammar_syntax_error(exc, source, "<expression>")) from exc
+    return ExternalExpressionTransformer().transform(tree)
+
+
+def _quote_eds_literal(token: str) -> str:
+    body = token[1:-1]
+    if token[0] == "'":
+        body = body.replace(r'\"', '"').replace('"', r'\"')
+    return f'"{body}"'
+
+
+def _external_rules_to_eds(rules: list[tuple[str, object]]) -> str:
+    """Lower parsed external grammar expressions into the native EDS syntax."""
+    nonterminals = {name for name, _ in rules}
+    generated = []
+    counter = 0
+
+    def helper(node, suffix: str) -> str:
+        nonlocal counter
+        counter += 1
+        name = f"tw_{suffix}_{counter}"
+        alternatives = emit_alternatives(node)
+        generated.append(f"{name} -> {' | '.join(alternatives)}")
+        nonterminals.add(name)
+        return name
+
+    def emit_item(node) -> list[str]:
+        kind = node[0]
+        if kind == "name":
+            name = node[1]
+            if name in {"epsilon", "empty"}:
+                return ["epsilon"]
+            return [f"<{name}>" if name in nonterminals else name]
+        if kind == "literal":
+            return [_quote_eds_literal(node[1])]
+        if kind in {"seq", "alt"}:
+            return [f"<{helper(node, 'group')}>"]
+        if kind == "quant":
+            base, quantifier = node[1], node[2]
+            base_name = helper(base, "repeat")
+            if quantifier == "?":
+                optional_name = helper(("alt", [("seq", [("name", base_name)]),
+                                                   ("seq", [])]), "optional")
+                return [f"<{optional_name}>"]
+            return [f"<{base_name}>{quantifier}"]
+        raise ValueError(f"unsupported expression node {kind!r}")
+
+    def emit_alternatives(node) -> list[str]:
+        if node[0] == "alt":
+            return [emit_sequence(branch) for branch in node[1]]
+        return [emit_sequence(node)]
+
+    def emit_sequence(node) -> str:
+        items = node[1] if node[0] == "seq" else [node]
+        emitted = [symbol for item in items for symbol in emit_item(item)]
+        return ", ".join(emitted) if emitted else "epsilon"
+
+    output = [f"{name} -> {' | '.join(emit_alternatives(node))}" for name, node in rules]
+    output.extend(generated)
+    return "\n".join(output) + "\n"
+
+
+def ebnf_to_eds(source: str) -> str:
+    """Convert character-oriented ISO EBNF into Tablewright's native syntax."""
+    try:
+        tree = _EXTERNAL_EXPRESSION_PARSER.parse(source, start="ebnf")
+    except UnexpectedInput as exc:
+        raise ValueError(format_grammar_syntax_error(exc, source, "<ebnf>")) from exc
+    rules = ExternalExpressionTransformer().transform(tree)
+    if not rules:
+        raise ValueError("EBNF grammar contains no rules")
+    return _external_rules_to_eds(rules)
+
+
+_LARK_GRAMMAR_PARSER = Lark.open_from_package(
+    "lark", "grammars/lark.lark", parser="lalr"
+)
+
+
+class LarkGrammarTransformer(Transformer):
+    """Transform the official ``lark.lark`` parse tree into frontend records."""
+
+    def name(self, children):
+        return ("name", str(children[0]))
+
+    def literal(self, children):
+        return ("literal", str(children[0]))
+
+    def literal_range(self, children):
+        return ("literal_range", str(children[0]), str(children[1]))
+
+    def expr(self, children):
+        values = [child for child in children if child is not None]
+        node = values[0]
+        if len(values) == 1:
+            return node
+        operator = str(values[1])
+        if operator in {"?", "*", "+"}:
+            return ("quant", node, operator)
+        raise ValueError("Lark repetition ranges (~ n or ~ n..m) are not supported")
+
+    def expansion(self, children):
+        return ("seq", list(children))
+
+    def alias(self, children):
+        # Parse aliases according to the official grammar. They only name Lark
+        # parse-tree branches and do not affect the recognized language.
+        return children[0]
+
+    def expansions(self, children):
+        return ("alt", list(children))
+
+    def maybe(self, children):
+        return ("quant", children[0], "?")
+
+    def rule_params(self, children):
+        if any(child is not None for child in children):
+            raise ValueError("Lark templates are not supported")
+        return None
+
+    token_params = rule_params
+
+    @staticmethod
+    def _definition(children, kind: str):
+        name = str(children[0])
+        expression = next(
+            (child for child in reversed(children)
+             if isinstance(child, tuple)),
+            None,
+        )
+        if expression is None:
+            raise ValueError(f"Lark {kind} {name} has no expression")
+        if expression[0] != "alt":
+            if expression[0] != "seq":
+                expression = ("seq", [expression])
+            expression = ("alt", [expression])
+        return (kind, name, expression)
+
+    def rule(self, children):
+        return self._definition(children, "rule")
+
+    def token(self, children):
+        return self._definition(children, "token")
+
+    def override_rule(self, children):
+        return children[0]
+
+    def ignore(self, _children):
+        return Discard
+
+    def import_(self, _children):
+        return Discard
+
+    def import_path(self, children):
+        return children
+
+    def multi_import(self, _children):
+        return Discard
+
+    def declare(self, _children):
+        return Discard
+
+    def priority(self, _children):
+        return None
+
+    def start(self, children):
+        return [child for child in children if child is not None]
+
+
+def _lark_terminal_characters(name: str, node) -> set[str]:
+    """Resolve a Lark terminal AST that denotes a set of single characters."""
+    branches = node[1] if node[0] == "alt" else [node]
+    characters = set()
+    for branch in branches:
+        items = branch[1] if branch[0] == "seq" else [branch]
+        if len(items) != 1:
+            raise ValueError(f"Lark terminal {name} must match exactly one character")
+        item = items[0]
+        if item[0] == "literal_range":
+            lo = unescape_character(item[1][1:-1])
+            hi = unescape_character(item[2][1:-1])
+            characters.update(chr(code) for code in range(ord(lo), ord(hi) + 1))
+            continue
+        if item[0] != "literal":
+            raise ValueError(f"Lark terminal {name} must be a literal or character class")
+        literal = item[1]
+        if literal.startswith("/"):
+            match = re.fullmatch(r"/\[([^]]+)\]/[imslux]*", literal)
+            single = re.fullmatch(r"/(\\?.)/[imslux]*", literal)
+            if match:
+                chars, _ = expand_range_token(f"[[{match.group(1)}]]")
+                characters.update(chars)
+            elif single:
+                characters.add(unescape_character(single.group(1)))
+            else:
+                raise ValueError(
+                    f"Lark terminal {name} must use a one-character regex or character class")
+        else:
+            suffix = "i" if literal.endswith('"i') else ""
+            quoted = literal[:-1] if suffix else literal
+            chars = scan_escaped_tokens(quoted[1:-1])
+            if len(chars) != 1:
+                raise ValueError(f"Lark terminal {name} must match exactly one character")
+            char = unescape_character(chars[0][0])
+            characters.update({char.lower(), char.upper()} if suffix else {char})
+    return characters
+
+
+def lark_to_eds(source: str) -> str:
+    """Parse official Lark syntax with Lark and lower character grammars to EDS."""
+    try:
+        tree = _LARK_GRAMMAR_PARSER.parse(source)
+    except UnexpectedInput as exc:
+        raise ValueError(format_grammar_syntax_error(exc, source, "<lark>")) from exc
+    records = LarkGrammarTransformer().transform(tree)
+    definitions = [record for record in records
+                   if isinstance(record, tuple) and len(record) == 3]
+    parser_rules = [(name, expression) for kind, name, expression in definitions
+                    if kind == "rule"]
+    terminals = [(name, expression) for kind, name, expression in definitions
+                 if kind == "token"]
+    if not parser_rules:
+        raise ValueError("Lark grammar contains no parser rules")
+    eds_terminals = []
+    for name, expression in terminals:
+        chars = _lark_terminal_characters(name, expression)
+        eds_terminals.append(f"{name} = {{{', '.join(sorted(chars, key=ord))}}}")
+    return "\n".join(eds_terminals) + "\n" + _external_rules_to_eds(parser_rules)
+
+
+def convert_to_eds(source: str, language: str) -> str:
+    """Normalize a supported input language to the native EDS frontend."""
+    converters = {"eds": lambda text: text, "ebnf": ebnf_to_eds, "lark": lark_to_eds}
+    return converters[language](source)
 
 
 class SpaceTransformer(Transformer):
@@ -2239,10 +2544,12 @@ def inline_pure_terminal_nonterminals(grammar: Grammar) -> Grammar:
         The grammar with pure character-class helpers inlined and removed (the
         original is returned unchanged if there are none).
     """
+    start = next(iter(grammar), None)
     pure = {
         nt: [p[0] for p in productions]
         for nt, productions in grammar.items()
-        if productions and all(len(p) == 1 and p[0].is_terminal() for p in productions)
+        if nt != start and productions
+        and all(len(p) == 1 and p[0].is_terminal() for p in productions)
     }
     if not pure:
         return grammar
@@ -3543,7 +3850,7 @@ struct {args.grammer_name} {{
 # install.
 
 
-def _build_identifier_table(gram_text: str) -> IdentifierTable:
+def _build_identifier_table(gram_text: str, language: str = "eds") -> IdentifierTable:
     """Run the front-end pipeline on grammar text and return its identifier table.
 
     Resets the module-global :data:`identifier_table` (so tests are isolated),
@@ -3563,6 +3870,7 @@ def _build_identifier_table(gram_text: str) -> IdentifierTable:
     identifier_table[SymbolType.terminal] = {
         "other": GrammerType([], SymbolType.negitive_set)
     }
+    gram_text = convert_to_eds(gram_text, language)
     tree = Lark(grammar, start="start").parse(gram_text)
     tree = (SpaceTransformer() * RuleTransformer() * SetTransformer()).transform(tree)
     add_identifers().visit(tree)
@@ -3584,7 +3892,8 @@ def _build_identifier_table(gram_text: str) -> IdentifierTable:
 
 def _generate_cpp(gram_text: str, *, optimization: int = 0,
                   q_grammar: bool = True, namespace: str = "g",
-                  guard: str = "G_H", grammar_name: str = "g") -> str:
+                  guard: str = "G_H", grammar_name: str = "g",
+                  language: str = "eds") -> str:
     """Build and render a grammar end to end, returning the generated C++ header.
 
     A thin wrapper over :func:`_build_identifier_table` plus
@@ -3602,7 +3911,7 @@ def _generate_cpp(gram_text: str, *, optimization: int = 0,
     Returns:
         The rendered header text.
     """
-    table = _build_identifier_table(gram_text)
+    table = _build_identifier_table(gram_text, language)
     args = argparse.Namespace(
         optimization=optimization, q_grammar=q_grammar,
         namespace=namespace, guard=guard, grammer_name=grammar_name,
@@ -4592,6 +4901,51 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("used", unused)
 
 
+class LanguageFrontendTests(unittest.TestCase):
+    """End-to-end coverage for the EBNF and Lark input frontends."""
+
+    def test_ebnf_generates_cpp(self):
+        cpp = _generate_cpp('start = "a", ["b"], {"c"};', language="ebnf")
+        self.assertIn("struct g", cpp)
+        self.assertIn("ctll::term<'a'>", cpp)
+
+    def test_ebnf_alternation(self):
+        cpp = _generate_cpp('start = "a" | "b";', language="ebnf")
+        self.assertIn("ctll::set<'a','b'>", cpp)
+
+    def test_ebnf_multiline_document_and_comment(self):
+        cpp = _generate_cpp(
+            '(* parsed as one EBNF document *)\n'
+            'start = prefix,\n "z";\n'
+            'prefix = "a" | "b";\n',
+            language="ebnf",
+        )
+        self.assertIn("struct start", cpp)
+        self.assertIn("ctll::set<'a','b'>", cpp)
+
+    def test_lark_generates_cpp(self):
+        cpp = _generate_cpp(
+            'start: LETTER DIGIT*\nLETTER: /[a-z]/\nDIGIT: /[0-9]/\n',
+            language="lark",
+        )
+        self.assertIn("struct g", cpp)
+        self.assertIn("ctll::set<", cpp)
+
+    def test_lark_rejects_multi_character_lexer_terminal(self):
+        with self.assertRaisesRegex(ValueError, "exactly one character"):
+            lark_to_eds('start: WORD\nWORD: "word"\n')
+
+    def test_lark_official_syntax_features(self):
+        cpp = _generate_cpp(
+            '%import common.WS\n'
+            '%ignore WS\n'
+            'start.1: "a" -> first_case\n'
+            '       | "b"  // multiline alternative\n',
+            language="lark",
+        )
+        self.assertIn("ctll::set<'a','b'>", cpp)
+
+
 # A small JSON-like grammar reused by the optimization tests.
 _SAMPLE_JSON = (
     "uchar=sigma-{\\\",\\\\}\n"
@@ -4616,7 +4970,7 @@ def build_test_suite() -> "unittest.TestSuite":
                  RangeExpansionTests, HexEscapeTests, SetDefinitionSyntaxTests,
                  RuleOperatorSyntaxTests, QuantifierGroupTests,
                  RangeLookaheadTests,
-                 QualityOfLifeTests, RegressionTests):
+                 QualityOfLifeTests, RegressionTests, LanguageFrontendTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     return suite
 
@@ -4643,25 +4997,35 @@ def run_tests(verbosity: int = 2) -> int:
 # Command-line interface
 # ======================================================================== #
 
-def is_accessible(path) -> bool:
+def is_accessible(path: str | Path) -> bool:
     """Return True if ``path`` is readable by the current process."""
-    return os.access(path, os.R_OK)
+    try:
+        with Path(path).open("rb"):
+            return True
+    except (OSError, ValueError):
+        return False
 
 
-def is_accessible_file(filepath) -> bool:
+def is_accessible_file(filepath: str | Path) -> bool:
     """Return True if ``filepath`` exists, is a regular file, and is readable."""
-    return os.path.isfile(filepath) and is_accessible(filepath)
+    path = Path(filepath)
+    return path.is_file() and is_accessible(path)
 
 
-def is_accessible_dir(dirpath) -> bool:
+def is_accessible_dir(dirpath: str | Path) -> bool:
     """Return True if ``dirpath`` exists, is a directory, and is readable."""
-    return os.path.isdir(dirpath) and is_accessible(dirpath)
+    path = Path(dirpath)
+    try:
+        next(path.iterdir(), None)
+        return path.is_dir()
+    except (OSError, ValueError):
+        return False
 
 
 class ValidateFileExistsAction(argparse.Action):
     """argparse action accepting ``-`` (stdin) or an existing, readable file."""
 
-    def __call__(self, parser, namespace, arg: TextIOWrapper, option_string=None):
+    def __call__(self, parser, namespace, arg: TextIOBase, option_string=None):
         """Store the opened file, or fail if it is neither stdin nor readable."""
         # ``arg`` is the opened file object; '-' denotes stdin (name is '<stdin>').
         if arg.name in ("-", "<stdin>") or is_accessible_file(arg.name):
@@ -4791,7 +5155,7 @@ def apply_filename_defaults(args: argparse.Namespace) -> None:
         args.fname = Path(f"{identifier}.hpp")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Define and parse the command-line interface.
 
     Returns:
@@ -4906,6 +5270,8 @@ def parse_args() -> argparse.Namespace:
                         help="Output directory, or a file path to write directly")
     parser.add_argument("--generator", type=str, default="cpp_ctll_v2",
                         help="Generator to use")
+    parser.add_argument("--lang", choices=("eds", "ebnf", "lark"), default="eds",
+                        help="Input grammar language (default: eds)")
 
     parser.add_argument("--fname", "--cfg:fname", type=Path, default=None,
                         help="Output filename (default: derived from the input "
@@ -4924,16 +5290,37 @@ def parse_args() -> argparse.Namespace:
                         help="C++ grammar struct name (default: derived from the "
                              "input filename)")
 
-    args, remaining_args = parser.parse_known_args()
+    args, remaining_args = parser.parse_known_args(argv)
 
     # Treat a bare positional path as --input=<path>.
     for arg in list(remaining_args):
-        if os.path.isfile(arg):
+        if Path(arg).is_file():
             remaining_args.remove(arg)
             remaining_args += [f"--input={arg}"]
 
     parser.parse_args(remaining_args, namespace=args)
+    standalone_mode = args.version or args.show_syntax or args.run_tests
+    if args.input is None and not standalone_mode:
+        parser.error("the following argument is required: --input")
     return args
+
+
+def _resolve_logging_level(args: argparse.Namespace) -> int:
+    """Return the effective console logging level for parsed CLI options."""
+    if args.trace:
+        return TRACE
+    if args.verbose:
+        return logging.DEBUG
+    if args.log:
+        return TRACE if args.log == "TRACE" else getattr(logging, args.log)
+    if args.quiet:
+        return logging.ERROR
+    return logging.INFO
+
+
+def _write_text(path: Path, content: str) -> None:
+    """Write UTF-8 text using :class:`pathlib.Path` consistently."""
+    path.write_text(content, encoding="utf-8")
 
 
 # ======================================================================== #
@@ -5020,11 +5407,13 @@ def write_debug_json(path, table: IdentifierTable, args) -> None:
         "terminal_aliases": aliases,
         "analysis": analysis_json,
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(document, f, indent=2, sort_keys=True)
+    Path(path).write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run the generator end to end from the command line.
 
     Parses arguments, configures logging, reads the ``.gram`` input, drives the
@@ -5032,38 +5421,27 @@ def main() -> None:
     build the parse table) and writes the rendered CTLL header to the output path.
     With ``--version`` it prints the version and exits.
     """
-    global logging_level
-    args = parse_args()
+    args = parse_args(argv)
 
     if args.version:
         print(VERSION)
-        exit(0)
+        return 0
 
     if getattr(args, "show_syntax", False):
         print(GRAMMAR_SYNTAX_REFERENCE)
-        exit(0)
+        return 0
 
     if getattr(args, "run_tests", False):
         # Run the built-in suite and exit with its pass/fail status. No input or
         # output files are needed for this mode.
-        exit(run_tests())
+        return run_tests()
 
     # Fill any unset output-config names (namespace/guard/fname/struct) from the
     # input filename, so a bare ``--input foo.gram`` needs no further flags.
     apply_filename_defaults(args)
 
     # Resolve the console logging level (most verbose flag wins).
-    if args.trace:
-        logging_level = TRACE
-    elif args.verbose:
-        logging_level = logging.DEBUG
-    elif args.log:
-        logging_level = TRACE if args.log == "TRACE" else getattr(logging, args.log)
-    elif args.quiet:
-        logging_level = logging.ERROR
-    else:
-        logging_level = logging.INFO
-
+    logging_level = _resolve_logging_level(args)
     configure_logging(logging_level, args.log_file)
     logger.debug(f"Tablewright {VERSION}")
     logger.debug(f"Arguments: {args}")
@@ -5073,20 +5451,24 @@ def main() -> None:
     # Optional: where to dump intermediate grammar stages for inspection.
     dump_dir = args.dump_stages
     if dump_dir is not None:
-        os.makedirs(dump_dir, exist_ok=True)
+        dump_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Dumping intermediate grammar stages to {dump_dir}")
 
     def dump_stage(filename, text):
         """Write an intermediate stage to the dump directory, if enabled."""
         if dump_dir is not None:
             path = Path(dump_dir) / filename
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text + "\n")
+            _write_text(path, text + "\n")
             logger.debug(f"  wrote {path}")
 
     with args.input as input_file:
         input_data = input_file.read()
     logger.debug(f"Read {len(input_data)} characters from {args.input.name}")
+
+    with timed_stage(f"Reading {args.lang.upper()} frontend", banner=args.lang != "eds"):
+        input_data = convert_to_eds(input_data, args.lang)
+    if args.lang != "eds":
+        logger.debug("Normalized EDS grammar:\n%s", input_data)
 
     with timed_stage(f"Parsing grammar file {args.input.name}"):
         tree = parse_grammar_text(input_data, args.input.name)
@@ -5162,7 +5544,7 @@ def main() -> None:
         )
         for line in explanation.splitlines():
             logger.info(line)
-        return
+        return 0
 
     # --analyze: print a grammar health report before generating. Built on the
     # normalized grammar so reachability/productivity reflect the real start.
@@ -5190,13 +5572,12 @@ def main() -> None:
     if check_only:
         logger.info(f"Grammar OK: {args.input.name} is a valid "
                     f"{'Q-grammar' if getattr(args, 'q_grammar', True) else 'LL(1) grammar'}")
-        return
+        return 0
 
     # Write to <output dir>/<fname>, or to --output directly if it is a file.
     output_dir = Path(args.output)
     out_path = output_dir / args.fname if output_dir.is_dir() else output_dir
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(constexpr_cpp)
+    _write_text(out_path, constexpr_cpp)
     logger.info(f"Wrote generated grammar to {out_path} "
                 f"({len(constexpr_cpp)} bytes)")
 
@@ -5208,15 +5589,21 @@ def main() -> None:
     if getattr(args, "stats", False):
         log_timing_summary()
 
+    return 0
+
+
+def main_cli() -> None:
+    """Console-script entry point that converts failures to process exit codes."""
+    try:
+        status = main()
+    except ValueError as error:
+        logger.error("error: %s", error)
+        status = 1
+    except Exception:
+        logger.exception("unexpected error")
+        status = 1
+    raise SystemExit(status)
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except ValueError as e:
-        # Grammar conflicts (e.g. not LL(1) under --strict) are user-facing input
-        # errors, not internal bugs: report them cleanly without a traceback.
-        logger.error(f"error: {e}")
-        exit(1)
-    except Exception as e:
-        logger.exception(f"error: {str(e)}")
-        exit(1)
+    main_cli()
