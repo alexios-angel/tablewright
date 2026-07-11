@@ -21,22 +21,26 @@ and produces the same shape of `rule(...)` table CTLL consumes.
 
 ## What it does
 
-Given a grammar in the `.gram` dialect, Tablewright emits a C++ header full of
-overloaded `rule` functions. CTLL runs a pushdown automaton entirely at compile
-time, selecting productions by overload resolution over rules shaped like:
+Given a grammar — in the native `.gram` (EDS) dialect, or in
+[ISO EBNF, W3C EBNF or Lark](#ebnf-w3c-ebnf-and-lark-input) — Tablewright
+emits a C++ header full of overloaded `rule` functions. CTLL runs a pushdown
+automaton entirely at compile time, selecting productions by overload
+resolution over rules shaped like:
 
 ```cpp
 static constexpr auto rule(State, ctll::term<'c'>) -> ctll::push<...>;
 ```
 
-The pipeline parses the grammar, collects terminals/nonterminals/actions,
+External dialects are first lowered to the EDS intermediate (inspectable
+with [`--emit-eds`](#inspecting-and-debugging-a-grammar)); from there one
+pipeline parses the grammar, collects terminals/nonterminals/actions,
 verifies every reference is defined, expands string literals into atoms,
 eliminates left recursion, left-factors to a fixed point, computes
 FIRST/FOLLOW and the `(q)LL(1)` parse table, and renders the CTLL header.
 
 ## Setup
 
-You need Python 3 and the [lark](https://github.com/lark-parser/lark) parser.
+You need Python 3.10+ and the [lark](https://github.com/lark-parser/lark) parser.
 
 ```bash
 git clone https://github.com/alexios-angel/tablewright.git
@@ -78,7 +82,7 @@ tablewright --check --input=pcre.gram
 
 ### EBNF, W3C EBNF and Lark input
 
-Use `--lang` to select the input frontend. The existing Extended Desatomat
+Use `--lang` to select the input frontend. The native Extended Desatomat
 syntax remains the default (`eds`):
 
 ```bash
@@ -90,34 +94,33 @@ tablewright --lang=lark --input=grammar.lark --output=include/
 tablewright --lang=lark --input=grammar.lark --emit-eds=grammar.gram --check
 ```
 
-Two EBNF dialects are supported, sharing one transformer and the same
-lowering path as every other frontend (**EBNF → EDS → C++**, `--emit-eds`
-included):
+Every frontend shares one lowering path — **dialect → EDS → C++** — and one
+AST, so `--emit-eds` always shows exactly the grammar the rest of the
+pipeline compiles, and the emitted file re-parses as a native `.gram`.
+
+#### ISO and W3C EBNF
 
 * `--lang=ebnf` — ISO/IEC 14977 style: `name = expression ;` rules (`::=`
   and `:` assignment and a `.` terminator are accepted as common
   variants), `,` concatenation, `|` alternation, `[x]` optional, `{x}`
   repetition, `(x)` grouping, `n * x` repetition factors, the `x - y`
   exception, quoted literals, `(* comments *)` and `epsilon`/`empty`;
-  postfix `? * +` remain as extensions. A special sequence written
-  `?name?` (no inner spaces) is a **semantic action**, EDS's `[name]` —
-  ISO's own escape hatch for implementation-defined content, put to work.
+  postfix `? * +` remain as extensions.
 * `--lang=w3c` — the W3C notation used by the XML specification:
   terminator-less `Name ::= expression` rules (parsed with Earley — where
   one rule ends is only decidable from the following `::=`),
   juxtaposition for sequence, character classes `[a-z#xB7]` / `[^...]`,
   `#xNN` code-point references, postfix `? * +`, the `A - B` exception,
   and both `/* */` and `(* *)` comments. W3C strings are literal — the
-  dialect has no escape mechanism; use `#xNN` references. `?name?` (no
-  inner spaces) is a semantic action here too; with a space after a
-  quantifier (`Item? Other`) there is never any confusion between the
-  two readings.
+  dialect has no escape mechanism; use `#xNN` references.
 
 An exception `x - y` is translatable exactly when both operands denote
 character sets — classes, single characters, or references to rules that
 reduce to them (the XML spec's `Char - '-'` idiom works); the set
 difference is computed during conversion, and anything else is rejected
 with an explanation rather than mistranslated.
+
+#### Lark
 
 The Lark frontend parses complete grammar documents with Tablewright's
 own **derived Lark grammar** (Lark parsing Lark): a vendored derivative of
@@ -126,26 +129,20 @@ spells out the *regex* language as grammar rules. At the document level a
 regex stays one token — its extent is lexical, and `%ignore` must never
 reach inside a pattern — and the token's body is then parsed with the
 regex layer (Earley, every character significant) into the same AST the
-rest of the frontend lowers. The frontend accepts parser rules with quoted
-literals (the case-insensitive `"..."i` form included), `".."` literal
-ranges, grouping, alternation, multiline alternatives, aliases,
-priorities, rule modifiers (`?rule`, `!rule`), `?`/`*`/`+` and counted
-`~ n` / `~ n..m` repetition. As a Tablewright extension, `@name` anywhere
-in an expansion is a **semantic action** — the counterpart of EDS's
-`[name]`, positional in the rule and pushed to CTLL's stack at that spot
-(`pair: key ":" @push_pair value`). Official Lark tools do not know `@`,
-so keep actions out of grammars you share with them.
+rest of the frontend lowers.
 
-The whole grammar is lowered to the EDS intermediate (write it out with
-`--emit-eds`) and from there compiled to C++ like any native grammar:
-**lark → EDS → C++**. The regex layer understands the language-defining
-core of the Python/Lark regex dialect: literals, `.`, character classes (ranges,
-negation, `\d \w \s`), `\xNN`/`\uNNNN`/`\UNNNNNNNN` escapes, groups
-(plain, `(?:...)`, `(?P<name>...)`), alternation, `? * +` and
-`{n}`/`{n,}`/`{n,m}` repetition, and the `i`, `s` and `x` flags. Constructs
-that select match *positions* rather than characters — anchors, word
-boundaries, lookarounds, backreferences, possessive quantifiers — cannot
-be expressed by a grammar rule and are rejected with a pointed error.
+The frontend accepts parser rules with quoted literals (the
+case-insensitive `"..."i` form included), `".."` literal ranges, grouping,
+alternation, multiline alternatives, aliases, priorities, rule modifiers
+(`?rule`, `!rule`), `?`/`*`/`+` and counted `~ n` / `~ n..m` repetition.
+The regex layer understands the language-defining core of the Python/Lark
+regex dialect: literals, `.`, character classes (ranges, negation,
+`\d \w \s`), `\xNN`/`\uNNNN`/`\UNNNNNNNN` escapes, groups (plain,
+`(?:...)`, `(?P<name>...)`), alternation, `? * +` and `{n}`/`{n,}`/`{n,m}`
+repetition, and the `i`, `s` and `x` flags. Constructs that select match
+*positions* rather than characters — anchors, word boundaries,
+lookarounds, backreferences, possessive quantifiers — cannot be expressed
+by a grammar rule and are rejected with a pointed error.
 
 A terminal whose language is one character out of a set (`DIGIT: /[0-9]/`,
 `SIGN: "+" | "-"`) stays a terminal — an EDS set. Any multi-character
@@ -158,6 +155,22 @@ and any conflict surfaces when the parse table is built. `%import` and
 `%declare` are parsed as Lark syntax; `%ignore` cannot be honored (there
 is no token stream to filter) and says so with a warning — weave optional
 whitespace into the rules instead.
+
+#### Semantic actions
+
+Every dialect can attach EDS-style semantic actions — the named hooks
+CTLL pushes onto its stack, positional within a rule body:
+
+| Dialect | Spelling | Example |
+| ------- | -------- | ------- |
+| EDS | `[name]` | `pair -> <key>, :, [push_pair], <value>` |
+| Lark | `@name` (a Tablewright extension) | `pair: key ":" @push_pair value` |
+| ISO / W3C EBNF | `?name?` (ISO's special sequence, no inner spaces) | `pair = key, ":", ?push_pair?, value;` |
+
+Action names surface as struct names in the generated C++, so they are
+validated (two or more characters, leading letter, no reserved words)
+rather than renamed. Official Lark tools do not know `@`, and a spaced
+`? name ?` special sequence is not recognized — write `?name?`.
 
 ## The `.gram` grammar dialect
 
@@ -185,13 +198,17 @@ A : <B>, x, [act] | epsilon      ':' works the same as '->'
 | `<B>`       | reference to nonterminal `B` (nonterminal names must be 2+ chars) |
 | `x`         | a single literal character (an *atom*)                           |
 | `"abc"`     | a string literal (expands to atoms `a`, `b`, `c`)                |
-| `[[a-z]]`   | a regex-style range (expands to a positive set; no negation)     |
+| `[[a-z]]`   | a regex-style range (expands to a set; a leading `^` negates: `[[^abc]]`) |
+| `(X Y)`     | a grouping; items separated by commas or whitespace              |
+| `X+` `X*`   | one-or-more / zero-or-more of an atom, string, range, terminal, `<nonterminal>` or group |
 | `[act]`     | a semantic action named `act`                                    |
 | &#124;      | the vertical bar; separates alternatives                         |
 | `,`         | separates the symbols of one alternative                         |
 | `epsilon`   | (or `@`) the empty production                                    |
 
-A `#` starts a comment to end of line.
+A `#` starts a comment to end of line. Escapes (`\n`, `\xNN`,
+`\u{H..H}`, `\c` for any literal character) work in atoms, set members,
+strings and ranges alike — `tablewright --syntax` prints the full rules.
 
 Because `:` can introduce either a set or a rule, a bare `name : a, b, c`
 (only atoms) is read as a **set**. To write a rule with `:`, give it a
@@ -276,9 +293,10 @@ raw parser internals.
 | `--grammar-name` `--cfg:grammar_name` | C++ grammar struct name (default: derived from the input filename)                         |
 | `--q`                  | Generate a Q-grammar (default)                                                                            |
 | `--no-q` `--strict`    | Require classic `LL(1)` instead of a Q-grammar                                                            |
-| `--ll`                 | Accepted for compatibility; ignored, as `LL(1)` output is the default. The original Desatomat uses this   |
+| `--ll`                 | Accepted for Desatomat compatibility; a no-op                                                             |
 | `-O0` … `-O3`          | Optimization level (see [Optimization](#optimization))                                                    |
 | `--range-lookaheads`   | Emit contiguous lookahead spans as `ctll::range<lo,hi>` instead of one wide `ctll::set`                   |
+| `--generator`          | Code generator to use (default and only built-in: `cpp_ctll_v2`)                                          |
 | `--quiet` `-q`         | Only log errors                                                                                           |
 | `--verbose`            | Verbose output: grammar dumps, FIRST/FOLLOW, parse table, optimization and aliasing details (DEBUG level) |
 | `--trace`              | Even more verbose than `--verbose`: log every FIRST/FOLLOW step, parse-table cell, merge/inline and alias |
@@ -287,10 +305,13 @@ raw parser internals.
 | `--run-tests`          | Run Tablewright's built-in test suite and exit                                                            |
 | `--version` `-v`       | Print version and exit                                                                                    |
 
-Beyond parity, Tablewright adds the `:` operator equivalences, regex-style
-`[[a-z]]` ranges, optional set braces, optimization levels, the inspection and
-validation tooling above, filename-derived defaults, and friendly error
-reporting.
+Beyond parity, Tablewright adds the ISO-EBNF, W3C-EBNF and Lark input
+frontends (with their own regex-to-grammar engine, semantic-action
+spellings and the `--emit-eds` intermediate), the `:` operator
+equivalences, regex-style `[[a-z]]` / `[[^a-z]]` ranges, grouping and
+`+`/`*` repetition, optional set braces, optimization levels, the
+inspection and validation tooling above, filename-derived defaults, and
+friendly error reporting.
 
 ## Development
 
