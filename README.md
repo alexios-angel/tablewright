@@ -77,22 +77,43 @@ it exits nonzero if the grammar is invalid:
 ./tablewright --check --input=pcre.gram
 ```
 
-### EBNF and Lark input
+### EBNF, W3C EBNF and Lark input
 
 Use `--lang` to select the input frontend. The existing Extended Desatomat
 syntax remains the default (`eds`):
 
 ```bash
 tablewright --lang=ebnf --input=grammar.ebnf --output=include/
+tablewright --lang=w3c  --input=grammar.txt  --output=include/
 tablewright --lang=lark --input=grammar.lark --output=include/
 
 # inspect (or keep) the EDS intermediate; --check skips the C++ output
 tablewright --lang=lark --input=grammar.lark --emit-eds=grammar.gram --check
 ```
 
-The EBNF frontend accepts `name = expression;` rules, quoted literals,
-alternation, grouping, optional expressions (`[...]` or `?`), repetition
-(`{...}`, `*`, and `+`), and `epsilon`/`empty`.
+Two EBNF dialects are supported, sharing one transformer and the same
+lowering path as every other frontend (**EBNF → EDS → C++**, `--emit-eds`
+included):
+
+* `--lang=ebnf` — ISO/IEC 14977 style: `name = expression ;` rules (`::=`
+  and `:` assignment and a `.` terminator are accepted as common
+  variants), `,` concatenation, `|` alternation, `[x]` optional, `{x}`
+  repetition, `(x)` grouping, `n * x` repetition factors, the `x - y`
+  exception, quoted literals, `(* comments *)` and `epsilon`/`empty`;
+  postfix `? * +` remain as extensions.
+* `--lang=w3c` — the W3C notation used by the XML specification:
+  terminator-less `Name ::= expression` rules (parsed with Earley — where
+  one rule ends is only decidable from the following `::=`),
+  juxtaposition for sequence, character classes `[a-z#xB7]` / `[^...]`,
+  `#xNN` code-point references, postfix `? * +`, the `A - B` exception,
+  and both `/* */` and `(* *)` comments. W3C strings are literal — the
+  dialect has no escape mechanism; use `#xNN` references.
+
+An exception `x - y` is translatable exactly when both operands denote
+character sets — classes, single characters, or references to rules that
+reduce to them (the XML spec's `Char - '-'` idiom works); the set
+difference is computed during conversion, and anything else is rejected
+with an explanation rather than mistranslated.
 
 The Lark frontend parses complete grammar documents with Tablewright's
 own **derived Lark grammar** (Lark parsing Lark): a vendored derivative of
@@ -238,7 +259,7 @@ raw parser internals.
 | Option                 | Description                                                                                                |
 | ---------------------- | -------------------------------------------------------------------------------------------------------- |
 | `--input`              | Input grammar file. Use `--input=-` to read from stdin                                                    |
-| `--lang`               | Input syntax: `eds` (default), `ebnf`, or `lark`                                                         |
+| `--lang`               | Input syntax: `eds` (default), `ebnf` (ISO 14977), `w3c` (XML-spec EBNF), or `lark`                       |
 | `--emit-eds PATH`      | Write the normalized EDS intermediate grammar to PATH (`-` for stdout); with `--lang=lark`/`ebnf` this is the converted grammar. Combine with `--check` to convert without generating C++ |
 | `--output`             | Output directory, or a file path to write directly. Default directory is the current directory            |
 | `--fname` `--cfg:fname`| Output filename (default: derived from the input filename, e.g. `pcre.gram` → `pcre.hpp`)                 |

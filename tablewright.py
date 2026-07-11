@@ -234,7 +234,7 @@ from typing import Dict, List, Optional, Sequence, Set
 from lark import Discard, Lark, Token, Transformer, Tree, Visitor
 from lark.exceptions import UnexpectedInput, VisitError
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 AUTHORS = [
     {"name": "Alexios Angel", "email": "aangeletakis@gmail.com"},
 ]
