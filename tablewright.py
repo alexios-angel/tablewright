@@ -3193,6 +3193,11 @@ def cpp_char_literal(char: str) -> str:
     if code_point > 0xFF:
         # Beyond one byte: a narrow literal would be ill-formed, so use char32_t.
         return f"U'\\x{format(code_point, 'X')}'"
+    if code_point >= 0x80:
+        # High bytes must compare equal to the parser's unsigned input
+        # units; a narrow '\xC2' literal is negative wherever char is
+        # signed, so emit a char32_t literal instead.
+        return f"U'\\x{format(code_point, '02X')}'"
     if not char.isprintable() or code_point < 0x20 or code_point > 0x7E:
         return f"'\\x{format(code_point, '02X')}'"
     return f"'{char}'"
@@ -3619,6 +3624,7 @@ def _emit_rules_for_nonterminal(nonterminal, entries: dict, terminal_table: dict
     group_has_eoi = {}        # rhs -> bool   ('$' -> ctll::epsilon)
     group_neg_sets = {}       # rhs -> list of negative-set char tuples
     shift_char_owner = {}     # char -> rhs of the shift production claiming it
+    shift_neg_exclusions = [] # exclusion sets of consuming negative sets
 
     for lookahead, production in entries.items():
         rhs = render_production_rhs(production, terminal_table, aliaser)
@@ -3647,6 +3653,12 @@ def _emit_rules_for_nonterminal(nonterminal, entries: dict, terminal_table: dict
             # Only the implicit global set becomes the ``_others`` lookahead; a
             # user-named set or an inline ``[[^...]]`` range (name is None) is a
             # negative set of its own.
+            kind = kinds.get(lookahead) if kinds is not None else None
+            if kind != "epsilon":
+                # a consuming negative set claims every character it does
+                # not exclude; remember the exclusions so epsilon-fallback
+                # rows can be reduced to the unclaimed characters
+                shift_neg_exclusions.append(set(resolved.value))
             if name == "other":
                 group_has_others[rhs] = True
             else:
@@ -3677,9 +3689,17 @@ def _emit_rules_for_nonterminal(nonterminal, entries: dict, terminal_table: dict
                 group_chars[rhs].update(resolved.value)
 
     # Characters consumed by a shift cell shadow the same characters in any
-    # epsilon-fallback cell of this state (Q-grammar: shift wins).
+    # epsilon-fallback cell of this state (Q-grammar: shift wins). A shift
+    # negative set claims everything outside its exclusion list, so an
+    # epsilon character survives only when every such set excludes it.
     for rhs in order:
-        group_chars[rhs] |= group_eps_chars[rhs] - set(shift_char_owner)
+        surviving = set()
+        for char in group_eps_chars[rhs]:
+            if char in shift_char_owner:
+                continue
+            if all(char in exclusions for exclusions in shift_neg_exclusions):
+                surviving.add(char)
+        group_chars[rhs] |= surviving
 
     def lookahead_token(type_string, chars, is_neg, gram_name=None):
         """Return the alias (if aliasing) or the inline type for a lookahead."""
@@ -3971,7 +3991,7 @@ class CharLiteralTests(unittest.TestCase):
 
     def test_high_byte_narrow(self):
         """A byte in 0x80-0xFF stays a narrow ``'\\xNN'`` literal."""
-        self.assertEqual(cpp_char_literal("\xff"), "'\\xFF'")
+        self.assertEqual(cpp_char_literal("\xff"), "U'\\xFF'")
 
     def test_wide_codepoint_uses_char32(self):
         """A code point above one byte uses a ``char32_t`` ``U'...'`` literal."""
@@ -4855,7 +4875,7 @@ class RegressionTests(unittest.TestCase):
         """An atom in 0x80-0xFF stays a narrow literal (no needless widening)."""
         cpp = _generate_cpp("St->\xff,<St>|epsilon\n")
         self.assertIn("'\\xFF'", cpp)
-        self.assertNotIn("U'\\xFF'", cpp)
+        self.assertIn("U'\\xFF'", cpp)
 
     def test_analysis_handles_inline_set_terminal(self):
         """Grammar analysis must not choke on an inline (range) set terminal.
