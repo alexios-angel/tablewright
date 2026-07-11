@@ -19,7 +19,8 @@ from .cli import _sanitize_cpp_identifier, apply_filename_defaults, main
 from .codegen import (_identifier_for_char, _safe_identifier, cpp_char_literal,
     render_char_class, render_neg_set, table_to_constexpr_cpp,
     TerminalAliaser)
-from .frontends import (_LARK_GRAMMAR_PARSER, _TABLEWRIGHT_LARK_GRAMMAR, ebnf_to_eds,
+from .frontends import (_LARK_GRAMMAR_PARSER, _TABLEWRIGHT_LARK_GRAMMAR,
+    antlr_to_eds, ebnf_to_eds,
     lark_to_eds, w3c_to_eds)
 from .gramparse import (_describe_expected_tokens, break_strings, grammar,
     GRAMMAR_SYNTAX_REFERENCE, identifier_table, parse_grammar_text)
@@ -1344,6 +1345,81 @@ class SemanticActionTests(unittest.TestCase):
         self.assertIn("epsilon", eds)
 
 
+class AntlrFrontendTests(unittest.TestCase):
+    """The ANTLR v4 frontend: grammars-v4-style .g4 files lowered to EDS."""
+
+    TOY = (
+        "grammar Toy;\n"
+        "options { language = Cpp; }\n"
+        "@header { #include <x> }\n"
+        "pair  : STRING ':' value EOF ;\n"
+        "value : STRING | NUMBER | flag {mark_value} ;\n"
+        "flag  : 'true' | 'false' ;\n"
+        "STRING : '\"' (~[\"\\\\] | '\\\\' .)* '\"' ;\n"
+        "NUMBER : [0-9]+ ('.' [0-9]+)? ;\n"
+        "WS : [ \\t\\r\\n]+ -> skip ;\n"
+    )
+
+    def test_json_flavored_grammar_builds(self):
+        with self.assertLogs(logger, level="WARNING") as captured:
+            cpp = _generate_cpp(self.TOY, language="antlr")
+        self.assertIn("struct g", cpp)
+        self.assertIn("mark_value", cpp)  # {name} became a semantic action
+        self.assertTrue(any("skip" in line for line in captured.output))
+
+    def test_terminal_classification_and_negation(self):
+        eds = antlr_to_eds("grammar Y;\ne : ID '=' NUM ;\n"
+                           "ID : LETTER+ ;\nfragment LETTER : 'a'..'z' ;\n"
+                           "NUM : [0-9]+ ;\nCH : ~'x' ;\n")
+        self.assertIn("LETTER = {a, b", eds)          # 'a'..'z' stays a set
+        self.assertIn("CH = sigma - {x}", eds)        # ~ is a complement
+        self.assertIn("ID -> LETTER+", eds)           # fragments lower plainly
+        self.assertIn("tw_e ->", eds)                 # short names get renamed
+
+    def test_negated_set_and_escape_idiom(self):
+        eds = antlr_to_eds(self.TOY)
+        self.assertIn('[[^"\\\\]]', eds)
+        self.assertIn("pair -> <STRING>, :, <value>", eds)  # EOF vanished
+
+    def test_predicate_and_untranslatables_are_rejected(self):
+        cases = [
+            ("grammar X;\nr : {code}? 'a' ;", "predicates"),
+            ("grammar X;\nmode ISLAND;\nr : 'a' ;", "modes"),
+            ("grammar X;\nimport Other;\nr : 'a' ;", "import"),
+            ("grammar X;\nr[int x] : 'a' ;", "arguments"),
+            ("grammar X;\nR : 'a' -> mode(OTHER) ;\nr : R ;", "mode"),
+            ("grammar X;\ntokens { EXT }\nr : EXT ;", "definition"),
+            ("grammar X;\nr : ~foo ;\nfoo : 'a' 'b' ;", "character set"),
+        ]
+        for source, needle in cases:
+            with self.assertRaisesRegex(ValueError, needle, msg=source):
+                antlr_to_eds(source)
+
+    def test_code_actions_drop_with_a_warning(self):
+        with self.assertLogs(logger, level="WARNING") as captured:
+            eds = antlr_to_eds("grammar X;\nr : 'a' {doIt();} 'b' ;")
+        self.assertIn("r -> a, b", eds)
+        self.assertTrue(any("dropped" in line for line in captured.output))
+
+    def test_mid_production_class_helper_regression(self):
+        # the '\\' . idiom exposed inline_pure_terminal_nonterminals
+        # reintroducing factored prefixes; the EDS reduction must build
+        cpp = _generate_cpp("St -> a, <anyc>, b\nanyc -> x | y")
+        self.assertIn("struct g", cpp)
+
+    def test_antlr_through_the_cli(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            grammar = Path(tmp) / "toy.g4"
+            grammar.write_text(self.TOY, encoding="utf-8")
+            eds_path = Path(tmp) / "toy.gram"
+            status = main(["--input", str(grammar), "--lang", "antlr",
+                           "--emit-eds", str(eds_path), "--check", "-q"])
+            self.assertEqual(status, 0)
+            self.assertIn("NUMBER -> [[0-9]]+",
+                          eds_path.read_text(encoding="utf-8"))
+
+
 class EmitEdsTests(unittest.TestCase):
     """The --emit-eds option: write the normalized EDS intermediate."""
 
@@ -1449,7 +1525,8 @@ def build_test_suite() -> "unittest.TestSuite":
                  RangeLookaheadTests,
                  QualityOfLifeTests, RegressionTests, LanguageFrontendTests,
                  RegexEngineTests, RegexGrammarTests, LarkRegexLoweringTests,
-                 EbnfDialectTests, SemanticActionTests, EmitEdsTests):
+                 EbnfDialectTests, SemanticActionTests, AntlrFrontendTests,
+                 EmitEdsTests):
         suite.addTests(loader.loadTestsFromTestCase(case))
     return suite
 

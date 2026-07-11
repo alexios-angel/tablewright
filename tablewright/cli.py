@@ -300,10 +300,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Output directory, or a file path to write directly")
     parser.add_argument("--generator", type=str, default="cpp_ctll_v2",
                         help="Generator to use")
-    parser.add_argument("--lang", choices=("eds", "ebnf", "lark", "w3c"),
+    parser.add_argument("--lang",
+                        choices=("eds", "ebnf", "lark", "w3c", "antlr"),
                         default="eds",
                         help="Input grammar language (default: eds); w3c is "
-                             "the XML-specification EBNF notation")
+                             "the XML-specification EBNF notation, antlr is "
+                             "ANTLR v4")
     parser.add_argument("--emit-eds", dest="emit_eds", type=str, default=None,
                         metavar="PATH",
                         help="Write the normalized EDS intermediate grammar to "

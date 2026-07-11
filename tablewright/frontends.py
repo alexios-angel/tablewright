@@ -114,8 +114,9 @@ def _charset_subtract(left, right):
     return ("charset", frozenset(right_chars - left_chars), False)
 
 
-def _resolve_exceptions(node, env: dict):
-    """Rewrite every EBNF ``("exception", a, b)`` node into a charset.
+def _resolve_set_operations(node, env: dict):
+    """Rewrite set-operation nodes -- EBNF ``("exception", a, b)`` and
+    ANTLR ``("negation", a)`` -- into concrete charsets.
 
     ``env`` maps rule names to their expressions so an operand may be a
     reference to a rule that itself reduces to a character set (the common
@@ -126,9 +127,17 @@ def _resolve_exceptions(node, env: dict):
             difference removes every character.
     """
     kind = node[0]
+    if kind == "negation":
+        inner = _resolve_set_operations(node[1], env)
+        reduced = _reduce_to_charset(inner, env, set())
+        if reduced is None:
+            raise ValueError(
+                "the set complement '~' is only translatable when its "
+                "operand denotes a character set")
+        return ("charset", reduced[1], not reduced[2])
     if kind == "exception":
-        left = _resolve_exceptions(node[1], env)
-        right = _resolve_exceptions(node[2], env)
+        left = _resolve_set_operations(node[1], env)
+        right = _resolve_set_operations(node[2], env)
         result = _charset_subtract(_reduce_to_charset(left, env, set()),
                                    _reduce_to_charset(right, env, set()))
         if result is None:
@@ -140,9 +149,9 @@ def _resolve_exceptions(node, env: dict):
             raise ValueError("the EBNF exception removes every character")
         return result
     if kind in {"seq", "alt"}:
-        return (kind, [_resolve_exceptions(child, env) for child in node[1]])
+        return (kind, [_resolve_set_operations(child, env) for child in node[1]])
     if kind == "quant":
-        return ("quant", _resolve_exceptions(node[1], env), node[2])
+        return ("quant", _resolve_set_operations(node[1], env), node[2])
     return node
 
 
@@ -276,7 +285,7 @@ def _w3c_code_point(reference: str) -> str:
 def _external_rules_to_eds(rules: "list[tuple[str, object]]") -> str:
     """Lower parsed external grammar expressions into the native EDS syntax."""
     env = {name: node for name, node in rules}
-    rules = [(name, _resolve_exceptions(node, env)) for name, node in rules]
+    rules = [(name, _resolve_set_operations(node, env)) for name, node in rules]
     rename = _allocate_eds_names([name for name, _ in rules])
     emitter = _EdsEmitter(nonterminals={rename[name] for name, _ in rules})
     renamed = [(rename[name], _rename_ast(node, rename))
@@ -524,6 +533,11 @@ def _reduce_to_charset(node, terminal_asts: dict, visiting: set):
         if len(node[1]) != 1:
             return None
         return ("charset", frozenset(node[1]), False)
+    if kind == "negation":
+        inner = _reduce_to_charset(node[1], terminal_asts, visiting)
+        if inner is None:
+            return None
+        return ("charset", inner[1], not inner[2])
     if kind == "exception":
         return _charset_subtract(
             _reduce_to_charset(node[1], terminal_asts, visiting),
@@ -598,29 +612,52 @@ def lark_to_eds(source: str) -> str:
                     if kind == "rule"]
     terminals = [(name, expression) for kind, name, expression in definitions
                  if kind == "token"]
-    if not parser_rules:
-        raise ValueError("Lark grammar contains no parser rules")
+    return _definitions_to_eds(parser_rules, terminals, declared,
+                               dialect="Lark",
+                               declared_label="%declare terminals",
+                               start_first=True)
 
-    # Undefined references are Lark-level errors; report them with Lark
-    # terminology before any renaming muddies the water.
-    defined = {name for name, _ in parser_rules} | {name for name, _ in terminals}
+
+def _definitions_to_eds(parser_rules, terminals, declared, dialect: str,
+                        declared_label: str, start_first: bool) -> str:
+    """The shared back half of the definition-based frontends (Lark, ANTLR).
+
+    Checks references, resolves set operations into concrete charsets,
+    decides which terminals can stay EDS sets, allocates EDS-legal names
+    and emits the grammar. ``start_first`` honors a dialect's convention
+    of a distinguished ``start`` rule (the EDS start symbol is simply the
+    first rule emitted).
+    """
+    if not parser_rules:
+        raise ValueError(f"{dialect} grammar contains no parser rules")
+
+    defined = ({name for name, _ in parser_rules}
+               | {name for name, _ in terminals})
     referenced = set()
     for _, expression in parser_rules + terminals:
         _collect_referenced_names(expression, referenced)
     missing = sorted(referenced - defined)
     undeclared = [name for name in missing if name not in declared]
     if undeclared:
-        raise ValueError(
-            "Lark grammar references undefined names: " + ", ".join(undeclared))
+        raise ValueError(f"{dialect} grammar references undefined names: "
+                         + ", ".join(undeclared))
     used_declared = sorted(set(missing) & declared)
     if used_declared:
         raise ValueError(
-            "%declare terminals have no definition to translate (CTLL has no "
+            f"{declared_label} have no definition to translate (CTLL has no "
             "external lexer): " + ", ".join(used_declared))
+
+    # ~complements and - exceptions become concrete charsets before
+    # anything else inspects the expressions
+    terminal_asts = dict(terminals)
+    parser_rules = [(name, _resolve_set_operations(expression, terminal_asts))
+                    for name, expression in parser_rules]
+    terminals = [(name, _resolve_set_operations(expression, terminal_asts))
+                 for name, expression in terminals]
+    terminal_asts = dict(terminals)
 
     # Decide which terminals can stay EDS terminal sets. The rest become
     # rules, recognized character by character.
-    terminal_asts = dict(terminals)
     set_terminals = {}
     rule_terminals = []
     for name, expression in terminals:
@@ -630,10 +667,11 @@ def lark_to_eds(source: str) -> str:
         else:
             rule_terminals.append((name, expression))
 
-    # The EDS start symbol is the first rule emitted; honor Lark's 'start'
-    # convention when present.
-    ordered_rules = sorted(parser_rules,
-                           key=lambda rule: rule[0] != "start")
+    if start_first:
+        ordered_rules = sorted(parser_rules,
+                               key=lambda rule: rule[0] != "start")
+    else:
+        ordered_rules = list(parser_rules)
 
     rename = _allocate_eds_names(
         [name for name, _ in ordered_rules]
@@ -659,8 +697,364 @@ def lark_to_eds(source: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Tablewright's ANTLR v4 document grammar, derived from the official
+# ANTLRv4Parser.g4 / ANTLRv4Lexer.g4 specifications and narrowed to the
+# translatable subset. Parser rules, lexer rules and fragments lower to
+# the same AST as every other frontend; lexer rules that denote one
+# character out of a set stay EDS terminals, everything else becomes
+# character-level rules (see the Lark frontend notes -- the same
+# no-separate-lexer semantics apply).
+#
+# What the subset rejects, deliberately and loudly: rule arguments /
+# returns / locals (they exist to feed target-language code), semantic
+# predicates {...}? (they change recognition), lexer mode commands
+# (mode/pushMode/popMode/more change tokenization itself), and imports
+# (rules living in another file). Embedded {...} code actions are
+# DROPPED with a warning -- they cannot run at compile time but do not
+# change the language -- with one exception: a block containing a bare
+# identifier, `{push_pair}`, is read as a Tablewright semantic action,
+# EDS's [push_pair]. `-> skip` / `-> channel(...)` / `-> type(...)`
+# commands are parsed and dropped with a warning, like Lark's %ignore.
+_ANTLR_GRAMMAR = r"""
+    antlr: _prequel* _adecl+
+
+    _prequel: grammar_decl
+            | OPTIONS_SPEC
+            | AT_ACTION
+            | delegate_import
+            | tokens_spec
+            | channels_spec
+
+    grammar_decl: GRAMMAR_KIND? "grammar" _aname ";"
+    delegate_import: "import" _aname ("," _aname)* ";"
+    tokens_spec: "tokens" "{" _aname ("," _aname)* ","? "}"
+    channels_spec: "channels" "{" _aname ("," _aname)* ","? "}"
+
+    _adecl: parser_rule | lexer_rule | mode_decl
+    mode_decl: "mode" _aname ";"
+
+    parser_rule: PNAME meta_item* ":" alt_list ";"
+    meta_item: ARG_ACTION            -> rule_args
+             | "returns" ARG_ACTION  -> rule_returns
+             | "locals" ARG_ACTION   -> rule_locals
+             | OPTIONS_SPEC          -> rule_options
+             | AT_ACTION             -> rule_at_action
+    lexer_rule: FRAGMENT_KW? TNAME ":" alt_list ";"
+
+    alt_list: alternative ("|" alternative)*
+    alternative: element* commands? hash_label?
+    hash_label: "#" _aname
+    commands: "->" command ("," command)*
+    command: PNAME ("(" _aname ")")?
+
+    element: labeled
+           | suffixed
+           | ACTION_BLOCK SUFFIX? -> embedded_action
+           | ELEM_OPTS            -> elem_options
+    labeled: _aname LABEL_OP suffixed
+    suffixed: primary SUFFIX?
+
+    ?primary: _aname                 -> name_ref
+            | LITERAL ".." LITERAL   -> char_range
+            | LITERAL                -> literal
+            | CHAR_SET               -> charset
+            | "."                    -> dot
+            | "~" primary            -> negation
+            | "(" alt_list ")"       -> group
+
+    _aname: PNAME | TNAME
+
+    GRAMMAR_KIND: "lexer" | "parser"
+    FRAGMENT_KW: "fragment"
+    LABEL_OP: "+=" | "="
+    PNAME: /[a-z][a-zA-Z_0-9]*/
+    TNAME: /[A-Z][a-zA-Z_0-9]*/
+    LITERAL: /'(?:\\.|[^'\\])+'/
+    CHAR_SET: /\[(?:\\.|[^\]\\])*\]/
+    ARG_ACTION: /\[[^\]]*\]/
+    ACTION_BLOCK: /\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}/
+    AT_ACTION: /@[a-zA-Z_][a-zA-Z_0-9]*(::[a-zA-Z_][a-zA-Z_0-9]*)?\s*\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}/
+    OPTIONS_SPEC: /options\s*\{[^{}]*\}/
+    ELEM_OPTS: /<[^<>]*>/
+    SUFFIX: /[?*+]\??/
+    COMMENT: /\/\/[^\n]*/ | /\/\*(.|\n)*?\*\//
+    %ignore COMMENT
+    %import common.WS
+    %ignore WS
+"""
+
+_ANTLR_PARSER = Lark(_ANTLR_GRAMMAR, parser="lalr", start="antlr")
+
+# ANTLR's '.' matches any single character; the complement of nothing has
+# no EDS spelling, so say "anything but newline, or a newline".
+_ANY_CHAR_NODE = ("alt", [("charset", frozenset("\n"), True),
+                          ("charset", frozenset("\n"), False)])
+
+_ANTLR_ESCAPES = {
+    "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
+}
+
+
+def _antlr_unescape(body: str, where: str) -> str:
+    r"""Decode ANTLR escapes (\n-family, \uXXXX, \u{...}, \c) in ``body``."""
+    out = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(body):
+            raise ValueError(f"dangling backslash in {where}")
+        escape = body[index + 1]
+        if escape in _ANTLR_ESCAPES:
+            out.append(_ANTLR_ESCAPES[escape])
+            index += 2
+            continue
+        if escape == "u":
+            if body[index + 2:index + 3] == "{":
+                end = body.index("}", index + 3)
+                code_point = int(body[index + 3:end], 16)
+                index = end + 1
+            else:
+                digits = body[index + 2:index + 6]
+                if len(digits) != 4 or not all(
+                        d in "0123456789abcdefABCDEF" for d in digits):
+                    raise ValueError(
+                        f"\\u needs four hex digits in {where}")
+                code_point = int(digits, 16)
+                index += 6
+            if code_point > 0x10FFFF:
+                raise ValueError(f"escape beyond U+10FFFF in {where}")
+            out.append(chr(code_point))
+            continue
+        out.append(escape)  # \' \\ \- \] and any other literal escape
+        index += 2
+    return "".join(out)
+
+
+def _antlr_char_set(token: str) -> frozenset:
+    """Expand an ANTLR ``[...]`` set body (no ``^`` negation -- ANTLR
+    negates with ``~[...]``) into its member characters."""
+    body = str(token)[1:-1]
+    chars = set()
+    index = 0
+
+    def read_one(index):
+        if body[index] == "\\":
+            if body[index + 1] == "u":
+                if body[index + 2:index + 3] == "{":
+                    end = body.index("}", index + 3)
+                    return chr(int(body[index + 3:end], 16)), end + 1
+                return chr(int(body[index + 2:index + 6], 16)), index + 6
+            escape = body[index + 1]
+            return _ANTLR_ESCAPES.get(escape, escape), index + 2
+        return body[index], index + 1
+
+    while index < len(body):
+        low, index = read_one(index)
+        if index < len(body) - 1 and body[index] == "-":
+            high, index2 = read_one(index + 1)
+            if ord(low) > ord(high):
+                raise ValueError(f"range {low!r}-{high!r} in {token} is "
+                                 "reversed")
+            chars.update(chr(code) for code in range(ord(low), ord(high) + 1))
+            index = index2
+        else:
+            chars.add(low)
+    if not chars:
+        raise ValueError(f"empty character set {token}")
+    return frozenset(chars)
+
+
+class AntlrGrammarTransformer(Transformer):
+    """Transform the ANTLR v4 parse tree into frontend records."""
+
+    def name_ref(self, children):
+        name = str(children[0])
+        if name == "EOF":
+            # end of input is implicit in a CTLL grammar
+            return ("seq", [])
+        return ("name", name)
+
+    def literal(self, children):
+        return ("text", _antlr_unescape(str(children[0])[1:-1],
+                                        str(children[0])))
+
+    def char_range(self, children):
+        low = _antlr_unescape(str(children[0])[1:-1], str(children[0]))
+        high = _antlr_unescape(str(children[1])[1:-1], str(children[1]))
+        if len(low) != 1 or len(high) != 1 or ord(low) > ord(high):
+            raise ValueError(
+                f"the range {children[0]}..{children[1]} needs ordered "
+                "single-character endpoints")
+        return ("charset",
+                frozenset(chr(code) for code in range(ord(low), ord(high) + 1)),
+                False)
+
+    def charset(self, children):
+        return ("charset", _antlr_char_set(children[0]), False)
+
+    def dot(self, _children):
+        return _ANY_CHAR_NODE
+
+    def negation(self, children):
+        return ("negation", children[0])
+
+    def group(self, children):
+        return children[0]
+
+    def suffixed(self, children):
+        node = children[0]
+        if len(children) == 1:
+            return node
+        suffix = str(children[1])
+        # a trailing '?' is ANTLR's non-greedy marker: it changes which
+        # match is preferred, never which strings match
+        return ("quant", node, suffix[0])
+
+    def labeled(self, children):
+        # `x=expr` / `x+=expr` labels only feed target-code actions
+        return children[2]
+
+    def embedded_action(self, children):
+        block = str(children[0])
+        if len(children) > 1:
+            raise ValueError(
+                "semantic predicates {...}? change what is recognized and "
+                "cannot be translated to a grammar")
+        body = block[1:-1].strip()
+        if re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", body):
+            # a bare identifier is a Tablewright semantic action, [name]
+            return ("action", body)
+        logger.warning("embedded {...} code has no compile-time "
+                       "counterpart and was dropped: %s",
+                       block if len(block) < 40 else block[:37] + "...")
+        return ("seq", [])
+
+    def elem_options(self, _children):
+        return ("seq", [])  # <assoc=right> and friends: tree-shaping only
+
+    def element(self, children):
+        return children[0]
+
+    def command(self, children):
+        name = str(children[0])
+        if name in {"mode", "pushMode", "popMode", "more"}:
+            raise ValueError(
+                f"the lexer command -> {name} switches lexer modes, which "
+                "change tokenization itself and cannot be translated")
+        logger.warning("the lexer command -> %s is parsed but not applied: "
+                       "CTLL grammars read characters directly (weave "
+                       "optional whitespace into the rules instead)", name)
+        return None
+
+    def commands(self, _children):
+        return None
+
+    def hash_label(self, _children):
+        return None
+
+    def alternative(self, children):
+        items = [child for child in children
+                 if child is not None and child != ("seq", [])]
+        return ("seq", items)
+
+    def alt_list(self, children):
+        if len(children) == 1:
+            return children[0]
+        return ("alt", list(children))
+
+    def _wrap(self, expression):
+        if expression[0] != "alt":
+            if expression[0] != "seq":
+                expression = ("seq", [expression])
+            expression = ("alt", [expression])
+        return expression
+
+    def parser_rule(self, children):
+        name = str(children[0])
+        expression = children[-1]
+        for child in children[1:-1]:
+            if child is not None:
+                raise ValueError(
+                    f"rule {name} uses arguments/returns/locals, which "
+                    "exist to feed target-language code and cannot be "
+                    "translated")
+        return ("rule", name, self._wrap(expression))
+
+    def rule_args(self, children):
+        return ("meta", str(children[0]))
+
+    rule_returns = rule_args
+    rule_locals = rule_args
+
+    def rule_options(self, _children):
+        return None
+
+    rule_at_action = rule_options
+
+    def lexer_rule(self, children):
+        # a fragment lowers exactly like any other lexer rule; it is
+        # simply never a start symbol
+        name = str(children[-2] if len(children) == 3 else children[0])
+        return ("token", name, self._wrap(children[-1]))
+
+    def mode_decl(self, children):
+        raise ValueError(
+            "lexer modes change tokenization itself and cannot be "
+            "translated; flatten the grammar to a single mode")
+
+    def delegate_import(self, children):
+        raise ValueError(
+            "ANTLR 'import' pulls rules from another grammar file; inline "
+            "them instead (Tablewright reads one self-contained grammar)")
+
+    def tokens_spec(self, children):
+        return ("declare", [str(child) for child in children])
+
+    def channels_spec(self, _children):
+        return None
+
+    def grammar_decl(self, _children):
+        return None
+
+    def antlr(self, children):
+        return [child for child in children if child is not None]
+
+
+def antlr_to_eds(source: str) -> str:
+    """Convert an ANTLR v4 grammar into Tablewright's native EDS syntax."""
+    try:
+        tree = _ANTLR_PARSER.parse(source)
+    except UnexpectedInput as exc:
+        raise ValueError(
+            format_grammar_syntax_error(exc, source, "<antlr>")) from exc
+    try:
+        records = AntlrGrammarTransformer().transform(tree)
+    except VisitError as exc:
+        if isinstance(exc.orig_exc, ValueError):
+            raise exc.orig_exc from None
+        raise
+    parser_rules = [(name, expr) for kind, name, expr in
+                    (r for r in records if isinstance(r, tuple) and len(r) == 3)
+                    if kind == "rule"]
+    terminals = [(name, expr) for kind, name, expr in
+                 (r for r in records if isinstance(r, tuple) and len(r) == 3)
+                 if kind == "token"]
+    declared = {name for record in records
+                if isinstance(record, tuple) and record[0] == "declare"
+                for name in record[1]}
+    return _definitions_to_eds(parser_rules, terminals, declared,
+                               dialect="ANTLR",
+                               declared_label="tokens {...} declarations",
+                               start_first=False)
+
+
 def convert_to_eds(source: str, language: str) -> str:
     """Normalize a supported input language to the native EDS frontend."""
     converters = {"eds": lambda text: text, "ebnf": ebnf_to_eds,
-                  "lark": lark_to_eds, "w3c": w3c_to_eds}
+                  "lark": lark_to_eds, "w3c": w3c_to_eds,
+                  "antlr": antlr_to_eds}
     return converters[language](source)

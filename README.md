@@ -22,7 +22,7 @@ and produces the same shape of `rule(...)` table CTLL consumes.
 ## What it does
 
 Given a grammar — in the native `.gram` (EDS) dialect, or in
-[ISO EBNF, W3C EBNF or Lark](#ebnf-w3c-ebnf-and-lark-input) — Tablewright
+[ISO EBNF, W3C EBNF, Lark or ANTLR v4](#ebnf-w3c-ebnf-lark-and-antlr-input) — Tablewright
 emits a C++ header full of overloaded `rule` functions. CTLL runs a pushdown
 automaton entirely at compile time, selecting productions by overload
 resolution over rules shaped like:
@@ -80,7 +80,7 @@ it exits nonzero if the grammar is invalid:
 tablewright --check --input=pcre.gram
 ```
 
-### EBNF, W3C EBNF and Lark input
+### EBNF, W3C EBNF, Lark and ANTLR input
 
 Use `--lang` to select the input frontend. The native Extended Desatomat
 syntax remains the default (`eds`):
@@ -89,6 +89,7 @@ syntax remains the default (`eds`):
 tablewright --lang=ebnf --input=grammar.ebnf --output=include/
 tablewright --lang=w3c  --input=grammar.txt  --output=include/
 tablewright --lang=lark --input=grammar.lark --output=include/
+tablewright --lang=antlr --input=grammar.g4 --output=include/
 
 # inspect (or keep) the EDS intermediate; --check skips the C++ output
 tablewright --lang=lark --input=grammar.lark --emit-eds=grammar.gram --check
@@ -156,6 +157,31 @@ and any conflict surfaces when the parse table is built. `%import` and
 is no token stream to filter) and says so with a warning — weave optional
 whitespace into the rules instead.
 
+#### ANTLR v4
+
+`--lang=antlr` reads ANTLR v4 grammars with Tablewright's own document
+grammar, derived from the official `ANTLRv4Parser.g4`/`ANTLRv4Lexer.g4`
+specifications and narrowed to the translatable subset: parser rules,
+lexer rules and `fragment`s, `'literals'`, `'a'..'z'` ranges, `[a-z]`
+character sets, the `~` complement, `.` (any character), grouping,
+alternation, `? * +` (non-greedy markers accepted — they never change the
+language), labels (`x=`, `+=`, `# AltLabel` — stripped), `EOF` (implicit
+in a CTLL grammar, dropped), `options`/`@header`-style sections
+(ignored), and `tokens {...}` declarations (an error if referenced —
+there is no external lexer to supply them). Lexer terminals classify
+exactly like Lark's: one-character sets stay EDS terminals, everything
+else becomes character-level rules, with the same no-lexer caveats.
+
+What cannot be translated is rejected with an explanation rather than
+mistranslated: semantic predicates `{...}?`, rule
+arguments/`returns`/`locals`, `import`, and lexer modes
+(`mode`/`pushMode`/`popMode`/`more`). Embedded `{...}` code actions are
+dropped with a warning (they cannot run at compile time but do not
+change the language) — except that a block holding one bare identifier,
+`{push_pair}`, is read as a Tablewright semantic action. `-> skip`,
+`-> channel(...)` and `-> type(...)` commands are parsed and dropped
+with a warning, like Lark's `%ignore`.
+
 #### Semantic actions
 
 Every dialect can attach EDS-style semantic actions — the named hooks
@@ -166,6 +192,7 @@ CTLL pushes onto its stack, positional within a rule body:
 | EDS | `[name]` | `pair -> <key>, :, [push_pair], <value>` |
 | Lark | `@name` (a Tablewright extension) | `pair: key ":" @push_pair value` |
 | ISO / W3C EBNF | `?name?` (ISO's special sequence, no inner spaces) | `pair = key, ":", ?push_pair?, value;` |
+| ANTLR v4 | `{name}` (a code block holding one bare identifier) | `pair : key ':' {push_pair} value ;` |
 
 Action names surface as struct names in the generated C++, so they are
 validated (two or more characters, leading letter, no reserved words)
@@ -284,7 +311,7 @@ raw parser internals.
 | Option                 | Description                                                                                                |
 | ---------------------- | -------------------------------------------------------------------------------------------------------- |
 | `--input`              | Input grammar file. Use `--input=-` to read from stdin                                                    |
-| `--lang`               | Input syntax: `eds` (default), `ebnf` (ISO 14977), `w3c` (XML-spec EBNF), or `lark`                       |
+| `--lang`               | Input syntax: `eds` (default), `ebnf` (ISO 14977), `w3c` (XML-spec EBNF), `lark`, or `antlr` (ANTLR v4)   |
 | `--emit-eds PATH`      | Write the normalized EDS intermediate grammar to PATH (`-` for stdout); with `--lang=lark`/`ebnf` this is the converted grammar. Combine with `--check` to convert without generating C++ |
 | `--output`             | Output directory, or a file path to write directly. Default directory is the current directory            |
 | `--fname` `--cfg:fname`| Output filename (default: derived from the input filename, e.g. `pcre.gram` → `pcre.hpp`)                 |
@@ -305,8 +332,8 @@ raw parser internals.
 | `--run-tests`          | Run Tablewright's built-in test suite and exit                                                            |
 | `--version` `-v`       | Print version and exit                                                                                    |
 
-Beyond parity, Tablewright adds the ISO-EBNF, W3C-EBNF and Lark input
-frontends (with their own regex-to-grammar engine, semantic-action
+Beyond parity, Tablewright adds the ISO-EBNF, W3C-EBNF, Lark and
+ANTLR v4 input frontends (with their own regex-to-grammar engine, semantic-action
 spellings and the `--emit-eds` intermediate), the `:` operator
 equivalences, regex-style `[[a-z]]` / `[[^a-z]]` ranges, grouping and
 `+`/`*` repetition, optional set braces, optimization levels, the
@@ -326,7 +353,7 @@ The package splits along the pipeline's own seams:
 
 | Module | Contents |
 | ------ | -------- |
-| `frontends.py`    | the Lark, ISO-EBNF and W3C-EBNF readers; `convert_to_eds` |
+| `frontends.py`    | the Lark, ISO-EBNF, W3C-EBNF and ANTLR v4 readers; `convert_to_eds` |
 | `regex_engine.py` | Tablewright's Lark grammar for the regex dialect and its AST transformer |
 | `eds.py`          | the EDS stringifier: escaping, `[[...]]` ranges, the emitter, name allocation |
 | `gramparse.py`    | the native `.gram` dialect: grammar, parsing, identifier collection, verification |

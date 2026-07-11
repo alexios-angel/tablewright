@@ -162,6 +162,29 @@ def inline_pure_terminal_nonterminals(grammar: Grammar) -> Grammar:
     }
     if not pure:
         return grammar
+    # A multi-alternative helper duplicates whatever precedes it: expanding
+    # ``prefix <X> rest`` yields one production per member that all share
+    # ``prefix`` and diverge afterwards -- the exact shape left factoring
+    # exists to remove, and a (q)LL(1) shift/shift conflict once it is
+    # reintroduced here, after factoring has already run. Such a helper is
+    # only safe to inline where every use is at the front of its production.
+    multi_names = {str(nt) for nt, terminals in pure.items()
+                   if len(terminals) > 1}
+    if multi_names:
+        unsafe = set()
+        for productions in grammar.values():
+            for production in productions:
+                for index, symbol in enumerate(production):
+                    if (index > 0 and symbol.is_non_terminal()
+                            and str(symbol) in multi_names):
+                        unsafe.add(str(symbol))
+        if unsafe:
+            logger.debug(f"Not inlining {len(unsafe)} class helper(s) used "
+                         f"mid-production: {', '.join(sorted(unsafe))}")
+            pure = {nt: terminals for nt, terminals in pure.items()
+                    if str(nt) not in unsafe}
+            if not pure:
+                return grammar
     pure_names = {str(nt) for nt in pure}
     logger.debug(f"Inlining {len(pure)} pure character-class nonterminal(s): "
                  f"{', '.join(sorted(pure_names))}")
